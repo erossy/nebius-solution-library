@@ -5,16 +5,16 @@ locals {
   regions_default = {
     eu-west1 = {
       platform = "cpu-d3"
-      preset   = "16vcpu-64gb"
+      preset   = "128vcpu-512gb"
     }
     eu-north1 = {
-      platform = "cpu-d3"
-      preset   = "16vcpu-64gb"
+      platform = "gpu-h100-sxm"
+      preset   = "8gpu-128vcpu-1600gb"
     }
 
     eu-north2 = {
       platform = "cpu-d3"
-      preset   = "16vcpu-64gb"
+      preset   = "128vcpu-512gb"
     }
   }
 

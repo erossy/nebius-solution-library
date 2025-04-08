@@ -1,9 +1,2 @@
-boto3
-matplotlib
-numpy
-pandas
-aiobotocore
-tqdm
-torch
-tensorflow
-aioboto3
+boto3>=1.26.0
+psutil>=5.9.0
