@@ -730,57 +730,56 @@ def high_performance_download_mock(
 
     # Get total size
     total_bytes = 0
+    file_sizes = {}
     for key in keys:
         response = s3_client.head_object(Bucket=bucket, Key=key)
-        total_bytes += response['ContentLength']
+        size = response['ContentLength']
+        file_sizes[key] = size
+        total_bytes += size
 
     # Distribute keys across processes
     keys_per_process = [[] for _ in range(processes)]
     for i, key in enumerate(keys):
         keys_per_process[i % processes].append(key)
 
+    # Since we're having issues with aiobotocore, let's use a simpler approach
+    # Each process will use boto3 with ThreadPoolExecutor instead of async
     def process_worker(process_keys, queue):
         """Worker function to download files within a process"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        try:
+            # Create a session for this process
+            session = boto3.Session(
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                region_name=region_name
+            )
+            s3_client = session.client('s3', endpoint_url=endpoint_url)
 
-        async def download_files_async():
-            # Create semaphore to limit concurrency
-            semaphore = asyncio.Semaphore(concurrency_per_process)
-
-            async def download_file(key):
-                async with semaphore:
-                    filename = os.path.basename(key)
-                    local_path = os.path.join(destination_dir, filename)
-
-                    # Use aiobotocore directly instead of aioboto3
-                    session = aiobotocore.get_session()
-                    async with session.create_client(
-                        's3',
-                        endpoint_url=endpoint_url,
-                        aws_access_key_id=aws_access_key_id,
-                        aws_secret_access_key=aws_secret_access_key,
-                        region_name=region_name
-                    ) as s3_client:
-                        # Stream the response
-                        response = await s3_client.get_object(Bucket=bucket, Key=key)
-                        with open(local_path, 'wb') as f:
-                            # Read in chunks to handle large files
-                            chunk = await response['Body'].read(8192)  # 8KB chunks
-                            while chunk:
-                                f.write(chunk)
-                                chunk = await response['Body'].read(8192)
-
-                        # Report success
+            # Use ThreadPoolExecutor for concurrent downloads
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_per_process) as executor:
+                # Function to download a single file
+                def download_file(key):
+                    try:
+                        filename = os.path.basename(key)
+                        local_path = os.path.join(destination_dir, filename)
+                        s3_client.download_file(bucket, key, local_path)
                         queue.put({'status': 'success', 'key': key})
+                    except Exception as e:
+                        print(f"Error downloading {key}: {str(e)}")
+                        queue.put({'status': 'error', 'key': key, 'error': str(e)})
 
-            # Create download tasks
-            tasks = [download_file(key) for key in process_keys]
+                # Submit all downloads
+                futures = [executor.submit(download_file, key) for key in process_keys]
 
-            # Wait for all downloads to complete
-            await asyncio.gather(*tasks)
+                # Wait for all futures to complete
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()  # Get result to catch any exceptions
+                    except Exception as e:
+                        print(f"Error in worker process: {str(e)}")
 
-        loop.run_until_complete(download_files_async())
+        except Exception as e:
+            print(f"Process worker error: {str(e)}")
 
     # Create a queue for process communication
     manager = multiprocessing.Manager()
@@ -797,6 +796,7 @@ def high_performance_download_mock(
                 target=process_worker,
                 args=(keys_per_process[i], result_queue)
             )
+            p.daemon = True  # Make sure process exits if main process crashes
             p.start()
             processes_list.append(p)
 
@@ -848,6 +848,35 @@ def high_performance_download_mock(
                 print(f"Error processing results: {str(e)}")
 
             time.sleep(0.1)
+
+    # Wait for processes to finish
+    for p in processes_list:
+        if p.is_alive():
+            p.terminate()
+
+    # Final check for any remaining results
+    while not result_queue.empty():
+        try:
+            result = result_queue.get_nowait()
+            if result['status'] == 'success':
+                completed += 1
+        except:
+            pass
+
+    # Calculate statistics
+    end_time = time.time()
+    duration = end_time - start_time
+    mb_per_sec = (total_bytes / (1024 * 1024)) / duration if duration > 0 else 0
+    gbits_per_sec = (mb_per_sec * 8) / 1000
+
+    return {
+        'method': f'high_performance(p={processes},c={concurrency_per_process})',
+        'files_downloaded': completed,
+        'total_bytes': total_bytes,
+        'duration_seconds': duration,
+        'mb_per_second': mb_per_sec,
+        'gbits_per_second': gbits_per_sec
+    }
 
     # Wait for processes to finish
     for p in processes_list:
@@ -918,6 +947,15 @@ def run_performance_tests(
     Returns:
         List of dictionaries with test results
     """
+    # Import the actual high-performance downloader
+    try:
+        from high_performance_s3_downloader import HighPerformanceS3Downloader
+        print("Using actual HighPerformanceS3Downloader implementation")
+    except ImportError as e:
+        print(f"Could not import HighPerformanceS3Downloader: {str(e)}")
+        print("Please ensure high_performance_s3_downloader.py is in your path")
+        return []
+
     results = []
 
     # For each file size category
@@ -975,18 +1013,41 @@ def run_performance_tests(
                 boto3_mp_stats['file_size_mb'] = size_mb
                 results.append(boto3_mp_stats)
 
-        # High-performance downloader tests (using mock implementation for this example)
+        # High-performance downloader tests
         for processes in processes_list:
             for concurrency in concurrency_list:
                 print(f"\nTesting high-performance downloader (processes={processes}, concurrency={concurrency})...")
-                hp_stats = high_performance_download_mock(
-                    endpoint_url, aws_access_key_id, aws_secret_access_key, region_name,
-                    bucket, size_keys, os.path.join(size_dir, f"high_perf_p{processes}_c{concurrency}"),
+
+                # Use the actual implementation
+                downloader = HighPerformanceS3Downloader(
+                    endpoint_url=endpoint_url,
+                    aws_access_key_id=aws_access_key_id,
+                    aws_secret_access_key=aws_secret_access_key,
+                    region_name=region_name,
                     processes=processes,
-                    concurrency_per_process=concurrency
+                    concurrency_per_process=concurrency,
+                    multipart_size_mb=5
                 )
-                hp_stats['file_size_mb'] = size_mb
-                results.append(hp_stats)
+
+                output_dir = os.path.join(size_dir, f"high_perf_p{processes}_c{concurrency}")
+                os.makedirs(output_dir, exist_ok=True)
+
+                start_time = time.time()
+                stats = downloader.download_files(
+                    bucket=bucket,
+                    keys=size_keys,
+                    destination_dir=output_dir,
+                    report_interval_sec=5
+                )
+                end_time = time.time()
+
+                # Update the stats dictionary with additional fields for consistency
+                stats['method'] = f'high_performance(p={processes},c={concurrency})'
+                stats['file_size_mb'] = size_mb
+                if 'duration_seconds' not in stats:
+                    stats['duration_seconds'] = end_time - start_time
+
+                results.append(stats)
 
     return results
 
@@ -1074,7 +1135,6 @@ def main():
     parser.add_argument('--skip-baseline', action='store_true', help='Skip baseline (slower) methods')
     parser.add_argument('--processes', type=int, nargs='+', default=[1, 2, 4, 8], help='Process counts to test')
     parser.add_argument('--concurrency', type=int, nargs='+', default=[10, 25, 50], help='Concurrency values to test')
-    parser.add_argument('--mock-only', action='store_true', help='Use mock implementation only (no actual high-performance downloader)')
 
     args = parser.parse_args()
 
@@ -1142,8 +1202,9 @@ def main():
         concurrency_list=args.concurrency
     )
 
-    # Visualize results
-    visualize_results(results, args.output_dir)
+    if results:
+        # Visualize results
+        visualize_results(results, args.output_dir)
 
     total_duration = time.time() - start_time
     print(f"\nTotal benchmark duration: {total_duration:.2f} seconds")
