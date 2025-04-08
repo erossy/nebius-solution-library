@@ -65,8 +65,7 @@ class UltraHighPerformanceS3Downloader:
             retries={'max_attempts': max_attempts},
             tcp_keepalive=tcp_keepalive,
             s3={
-                'use_accelerate_endpoint': True,  # Enable transfer acceleration if available
-                'addressing_style': 'virtual'  # Use virtual-hosted style addressing
+                'addressing_style': 'virtual'  # Use virtual-hosted style addressing for better performance
             }
         )
 
