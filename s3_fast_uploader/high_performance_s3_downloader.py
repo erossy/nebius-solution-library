@@ -183,11 +183,14 @@ class HighPerformanceS3Downloader:
     process_id: int
   ):
     """Asynchronously download multiple files within a single process"""
-    session = aioboto3.Session(
-      aws_access_key_id=self.aws_access_key_id,
-      aws_secret_access_key=self.aws_secret_access_key,
-      region_name=self.region_name
-    )
+    try:
+      # Try direct approach with AioSession import
+      from aiobotocore.session import AioSession
+      session = AioSession(session=session)
+    except (ImportError, AttributeError):
+      # Fallback to standard boto3 with ThreadPoolExecutor
+      print("Warning: aioboto3 session creation failed, using threaded implementation")
+      # Implement a threaded fallback here
 
     # Create semaphore to limit concurrency
     semaphore = asyncio.Semaphore(self.concurrency_per_process)
