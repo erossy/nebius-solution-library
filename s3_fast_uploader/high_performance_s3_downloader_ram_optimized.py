@@ -78,10 +78,11 @@ class HighPerformanceS3DownloaderRAMOptimized:
         self.chunk_threshold_mb = chunk_threshold_mb
 
         # Use provided process count or default to CPU count - 4
-        self.processes = processes if processes is not None else max(1, cpu_count() - 4)
+        default_processes = max(1, cpu_count() - 4)
+        self.processes = processes if processes is not None else default_processes
 
-        # Use provided concurrency or default to 4 threads per process
-        self.concurrency_per_process = concurrency_per_process if concurrency_per_process is not None else 4
+        # Use provided concurrency or default to 10 threads per process
+        self.concurrency_per_process = concurrency_per_process if concurrency_per_process is not None else 10
 
         # Validate parameters
         total_memory_mb = psutil.virtual_memory().total / (1024 * 1024)
@@ -768,10 +769,10 @@ if __name__ == "__main__":
     parser.add_argument('--bucket', required=True, help='S3 bucket name')
     parser.add_argument('--prefix', default='', help='S3 key prefix to filter objects')
     # Performance tuning parameters
-    parser.add_argument('--processes', type=int, default=124,
-                      help='Number of processes to use (default: 124, recommended: CPU count - 4)')
-    parser.add_argument('--concurrency', type=int, default=4,
-                      help='Number of download threads per process (default: 4)')
+    parser.add_argument('--processes', type=int, default=None,
+                      help='Number of processes to use (defaults to CPU count - 4)')
+    parser.add_argument('--concurrency', type=int, default=10,
+                      help='Number of download threads per process (default: 10, recommended: 8-16)')
     parser.add_argument('--chunk-size-mb', type=int, default=128,
                       help='Size of each chunk in MB (default: 128). Larger chunks reduce overhead but require more memory')
     parser.add_argument('--chunk-threshold-mb', type=int, default=1024,
