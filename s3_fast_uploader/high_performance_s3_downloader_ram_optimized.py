@@ -77,20 +77,23 @@ class HighPerformanceS3DownloaderRAMOptimized:
         self.region_name = region_name
         self.chunk_threshold_mb = chunk_threshold_mb
 
-        # Optimize process count for 128 vCPUs
-        # Leave some CPUs for system and network I/O
-        self.processes = processes if processes else max(1, cpu_count() - 4)
+        # Use provided process count or default to CPU count - 4
+        self.processes = processes if processes is not None else max(1, cpu_count() - 4)
 
-        # Auto-calculate optimal concurrency based on available resources
-        if concurrency_per_process is None:
-            total_memory_mb = psutil.virtual_memory().total / (1024 * 1024)
-            memory_per_process_mb = (memory_limit_gb * 1024) / self.processes
-            self.concurrency_per_process = min(
-                50,  # Maximum concurrent downloads per process
-                int(memory_per_process_mb / multipart_size_mb)
-            )
-        else:
-            self.concurrency_per_process = concurrency_per_process
+        # Use provided concurrency or default to 4 threads per process
+        self.concurrency_per_process = concurrency_per_process if concurrency_per_process is not None else 4
+
+        # Validate parameters
+        total_memory_mb = psutil.virtual_memory().total / (1024 * 1024)
+        max_concurrent_chunks = self.processes * self.concurrency_per_process
+        memory_per_chunk_mb = multipart_size_mb * 2  # Account for buffers and overhead
+        total_required_memory_mb = max_concurrent_chunks * memory_per_chunk_mb
+
+        if total_required_memory_mb > memory_limit_gb * 1024:
+            print(f"\nWarning: Current configuration might require up to {total_required_memory_mb/1024:.1f} GB RAM:")
+            print(f"  - {self.processes} processes × {self.concurrency_per_process} threads = {max_concurrent_chunks} concurrent chunks")
+            print(f"  - Each {multipart_size_mb} MB chunk might use up to {memory_per_chunk_mb} MB RAM")
+            print(f"  - Memory limit is set to {memory_limit_gb} GB")
 
         self.multipart_size_mb = multipart_size_mb
         self.max_attempts = max_attempts
@@ -103,14 +106,18 @@ class HighPerformanceS3DownloaderRAMOptimized:
         if self.verbose:
             print(f"\nInitialized Optimized S3 Downloader with:")
             print(f"  Hardware Configuration:")
-            print(f"    CPUs: {cpu_count()}")
-            print(f"    RAM: {psutil.virtual_memory().total / (1024**3):.1f} GB")
-            print(f"  Download Configuration:")
+            print(f"    Available CPUs: {cpu_count()}")
+            print(f"    Available RAM: {psutil.virtual_memory().total / (1024**3):.1f} GB")
+            print(f"  Parallel Processing Configuration:")
             print(f"    Processes: {self.processes}")
-            print(f"    Concurrency per process: {self.concurrency_per_process}")
-            print(f"    Multipart chunk size: {self.multipart_size_mb} MB")
+            print(f"    Threads per process: {self.concurrency_per_process}")
+            print(f"    Total concurrent downloads: {self.processes * self.concurrency_per_process}")
+            print(f"  Chunk Configuration:")
+            print(f"    Chunk size: {self.multipart_size_mb} MB")
             print(f"    Parallel threshold: {self.chunk_threshold_mb} MB")
+            print(f"    Max memory usage: {total_required_memory_mb/1024:.1f} GB")
             print(f"    Memory limit: {self.memory_limit_gb} GB")
+            print(f"  Network Configuration:")
             print(f"    Network timeout: {self.network_timeout}s")
             print(f"    TCP keepalive: {self.tcp_keepalive}")
             print(f"    Max pool connections: {self.max_pool_connections}")
@@ -386,27 +393,30 @@ class HighPerformanceS3DownloaderRAMOptimized:
         try:
             start_time = time.time()
 
-            # Calculate optimal chunk size and number of chunks
-            chunk_size = max(
-                self.multipart_size_mb * 1024 * 1024,
-                min(file_size // (self.processes * 2), 256 * 1024 * 1024)  # Max 256MB chunks
-            )
+            # Use configured chunk size
+            chunk_size = self.multipart_size_mb * 1024 * 1024
             num_chunks = (file_size + chunk_size - 1) // chunk_size
 
+            # Calculate chunk range for this process
+            chunks_per_process = (num_chunks + self.processes - 1) // self.processes
+            start_chunk = process_id * chunks_per_process
+            end_chunk = min(start_chunk + chunks_per_process, num_chunks)
+
             if self.verbose:
-                print(f"[{thread_id}] Downloading {key} in {num_chunks} chunks "
-                      f"of {chunk_size / (1024*1024):.1f}MB each")
+                print(f"[Process-{process_id}] Handling chunks {start_chunk} to {end_chunk-1} "
+                      f"of {num_chunks} total chunks ({chunk_size / (1024*1024):.1f}MB each)")
 
             # Pre-allocate buffer for the entire file
             file_buffer = bytearray(file_size)
 
-            # Download chunks in parallel
+            # Download assigned chunks using thread pool
             with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(num_chunks, self.concurrency_per_process)
+                max_workers=self.concurrency_per_process
             ) as executor:
                 futures = []
 
-                for chunk_index in range(num_chunks):
+                # Only process chunks assigned to this process
+                for chunk_index in range(start_chunk, end_chunk):
                     start_byte = chunk_index * chunk_size
                     end_byte = min(start_byte + chunk_size, file_size) - 1
 
@@ -757,11 +767,17 @@ if __name__ == "__main__":
     parser.add_argument('--region', default=None, help='AWS region name')
     parser.add_argument('--bucket', required=True, help='S3 bucket name')
     parser.add_argument('--prefix', default='', help='S3 key prefix to filter objects')
-    parser.add_argument('--processes', type=int, default=None, help='Number of processes to use')
-    parser.add_argument('--concurrency', type=int, default=None, help='Concurrent downloads per process')
-    parser.add_argument('--multipart-size-mb', type=int, default=128, help='Multipart chunk size in MB')
-    parser.add_argument('--chunk-threshold-mb', type=int, default=512, help='Files larger than this will use parallel downloading (MB)')
-    parser.add_argument('--memory-limit-gb', type=float, default=1500, help='Maximum RAM usage in GB')
+    # Performance tuning parameters
+    parser.add_argument('--processes', type=int, default=124,
+                      help='Number of processes to use (default: 124, recommended: CPU count - 4)')
+    parser.add_argument('--concurrency', type=int, default=4,
+                      help='Number of download threads per process (default: 4)')
+    parser.add_argument('--chunk-size-mb', type=int, default=128,
+                      help='Size of each chunk in MB (default: 128). Larger chunks reduce overhead but require more memory')
+    parser.add_argument('--chunk-threshold-mb', type=int, default=1024,
+                      help='Files larger than this will use parallel downloading (default: 1024 MB)')
+    parser.add_argument('--memory-limit-gb', type=float, default=1500,
+                      help='Maximum RAM usage in GB (default: 1500)')
     parser.add_argument('--report-interval', type=int, default=5, help='Progress reporting interval in seconds')
     parser.add_argument('--max-files', type=int, default=None, help='Maximum number of files to download')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
@@ -777,7 +793,7 @@ if __name__ == "__main__":
         region_name=args.region,
         processes=args.processes,
         concurrency_per_process=args.concurrency,
-        multipart_size_mb=args.multipart_size_mb,
+        multipart_size_mb=args.chunk_size_mb,
         chunk_threshold_mb=args.chunk_threshold_mb,
         memory_limit_gb=args.memory_limit_gb,
         verbose=args.verbose
