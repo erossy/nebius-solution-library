@@ -75,6 +75,7 @@ class HighPerformanceS3DownloaderRAMOptimized:
         self.aws_access_key_id = aws_access_key_id
         self.aws_secret_access_key = aws_secret_access_key
         self.region_name = region_name
+        self.chunk_threshold_mb = chunk_threshold_mb
 
         # Optimize process count for 128 vCPUs
         # Leave some CPUs for system and network I/O
