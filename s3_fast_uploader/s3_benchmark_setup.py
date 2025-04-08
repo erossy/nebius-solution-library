@@ -1,6 +1,6 @@
 """
-S3 Download Performance Testing Guide (Revised)
-==============================================
+S3 Download Performance Testing Guide
+====================================
 
 This guide outlines a structured approach to benchmark the high-performance S3 downloader
 on a single node and compare its performance against standard methods.
@@ -19,10 +19,9 @@ import asyncio
 from tqdm import tqdm
 import json
 import multiprocessing
-import shutil
 
 # Import the high-performance downloader
-# from high_performance_s3_downloader import HighPerformanceS3Downloader
+from high_performance_s3_downloader import HighPerformanceS3Downloader
 
 def prepare_test_files(
     s3_client,
@@ -33,7 +32,6 @@ def prepare_test_files(
 ):
     """
     Generate and upload test files of specific sizes to S3 bucket.
-    Files are uploaded using multipart upload to handle large files efficiently.
 
     Args:
         s3_client: Boto3 S3 client
@@ -53,66 +51,17 @@ def prepare_test_files(
 
     for size_mb in file_sizes_mb:
         for i in range(num_files_per_size):
+            # Generate a random binary file of the specified size
+            # Using random data to prevent compression benefits
+            random_bytes = random.randbytes(size_mb * 1024 * 1024)
+            data = io.BytesIO(random_bytes)
+
             # Create a key with size in the name
             key = f"{prefix}/test_{size_mb}mb_{i}.bin"
+
             print(f"Uploading {key} ({size_mb} MB)...")
-
-            # Create file in chunks to avoid memory issues
-            chunk_size_mb = 10  # Use smaller chunks (10MB)
-            total_chunks = size_mb // chunk_size_mb
-            if size_mb % chunk_size_mb != 0:
-                total_chunks += 1
-
-            # Upload in chunks using multipart upload
-            mpu = s3_client.create_multipart_upload(Bucket=bucket_name, Key=key)
-            parts = []
-
-            try:
-                for chunk_idx in range(total_chunks):
-                    # Last chunk might be smaller
-                    current_chunk_size = min(chunk_size_mb, size_mb - (chunk_idx * chunk_size_mb))
-
-                    # Generate random data for this chunk
-                    chunk_bytes = os.urandom(current_chunk_size * 1024 * 1024)
-
-                    # Upload part
-                    part_number = chunk_idx + 1
-                    response = s3_client.upload_part(
-                        Bucket=bucket_name,
-                        Key=key,
-                        PartNumber=part_number,
-                        UploadId=mpu['UploadId'],
-                        Body=chunk_bytes
-                    )
-
-                    # Save ETag for completion
-                    parts.append({
-                        'PartNumber': part_number,
-                        'ETag': response['ETag']
-                    })
-
-                    print(f"  Uploaded part {part_number}/{total_chunks} for {key}")
-
-                # Complete multipart upload
-                s3_client.complete_multipart_upload(
-                    Bucket=bucket_name,
-                    Key=key,
-                    UploadId=mpu['UploadId'],
-                    MultipartUpload={'Parts': parts}
-                )
-
-                file_keys[size_mb].append(key)
-                print(f"  Completed upload of {key}")
-
-            except Exception as e:
-                # Abort upload if something goes wrong
-                s3_client.abort_multipart_upload(
-                    Bucket=bucket_name,
-                    Key=key,
-                    UploadId=mpu['UploadId']
-                )
-                print(f"  Error uploading {key}: {str(e)}")
-                raise
+            s3_client.upload_fileobj(data, bucket_name, key)
+            file_keys[size_mb].append(key)
 
     return file_keys
 
@@ -243,7 +192,7 @@ async def aioboto3_download_single(
     max_concurrency=25
 ):
     """
-    Download files using aiobotocore for async I/O.
+    Download files using aioboto3 for async I/O.
 
     Returns:
         Dictionary with performance statistics
@@ -281,14 +230,8 @@ async def aioboto3_download_single(
                 aws_secret_access_key=aws_secret_access_key,
                 region_name=region_name
             ) as s3_client:
-                # Stream the response
-                response = await s3_client.get_object(Bucket=bucket, Key=key)
                 with open(local_path, 'wb') as f:
-                    # Read in chunks to handle large files
-                    chunk = await response['Body'].read(8192)  # 8KB chunks
-                    while chunk:
-                        f.write(chunk)
-                        chunk = await response['Body'].read(8192)
+                    await s3_client.download_fileobj(bucket, key, f)
 
     # Create download tasks
     tasks = [download_file(key) for key in keys]
@@ -298,12 +241,8 @@ async def aioboto3_download_single(
 
     # Helper to update progress
     async def update_progress(task):
-        try:
-            await task
-            progress.update(1)
-        except Exception as e:
-            print(f"\nError during async download: {str(e)}")
-            raise
+        await task
+        progress.update(1)
 
     # Start downloading
     start_time = time.time()
@@ -401,8 +340,7 @@ def boto3_multiprocess_download(
         'gbits_per_second': gbits_per_sec
     }
 
-# Mock implementation for testing without the actual high-performance downloader
-def high_performance_download_mock(
+def high_performance_download(
     endpoint_url,
     aws_access_key_id,
     aws_secret_access_key,
@@ -415,136 +353,31 @@ def high_performance_download_mock(
     multipart_size_mb=5
 ):
     """
-    Mock implementation of high-performance downloader for testing purposes.
-    Combines multiprocessing with async download within each process.
+    Download files using our high-performance S3 downloader.
 
     Returns:
         Dictionary with performance statistics
     """
-    print(f"Using mock high-performance downloader with {processes} processes and {concurrency_per_process} concurrent downloads per process")
-
-    os.makedirs(destination_dir, exist_ok=True)
-
-    # Create session and client for size calculation
-    session = boto3.Session(
+    downloader = HighPerformanceS3Downloader(
+        endpoint_url=endpoint_url,
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
-        region_name=region_name
+        region_name=region_name,
+        processes=processes,
+        concurrency_per_process=concurrency_per_process,
+        multipart_size_mb=multipart_size_mb
     )
-    s3_client = session.client('s3', endpoint_url=endpoint_url)
 
-    # Get total size
-    total_bytes = 0
-    for key in keys:
-        response = s3_client.head_object(Bucket=bucket, Key=key)
-        total_bytes += response['ContentLength']
+    stats = downloader.download_files(
+        bucket=bucket,
+        keys=keys,
+        destination_dir=destination_dir
+    )
 
-    # Distribute keys across processes
-    keys_per_process = [[] for _ in range(processes)]
-    for i, key in enumerate(keys):
-        keys_per_process[i % processes].append(key)
+    # Add method name to stats
+    stats['method'] = f'high_performance(p={processes},c={concurrency_per_process})'
 
-    def process_worker(process_keys, queue):
-        """Worker function to download files within a process"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def download_files_async():
-            # Create session
-            session = aiobotocore.session.AioSession()
-
-            # Create semaphore to limit concurrency
-            semaphore = asyncio.Semaphore(concurrency_per_process)
-
-            async def download_file(key):
-                async with semaphore:
-                    filename = os.path.basename(key)
-                    local_path = os.path.join(destination_dir, filename)
-
-                    async with session.create_client(
-                        's3',
-                        endpoint_url=endpoint_url,
-                        aws_access_key_id=aws_access_key_id,
-                        aws_secret_access_key=aws_secret_access_key,
-                        region_name=region_name
-                    ) as s3_client:
-                        # Stream the response
-                        response = await s3_client.get_object(Bucket=bucket, Key=key)
-                        with open(local_path, 'wb') as f:
-                            # Read in chunks to handle large files
-                            chunk = await response['Body'].read(8192)  # 8KB chunks
-                            while chunk:
-                                f.write(chunk)
-                                chunk = await response['Body'].read(8192)
-
-                        # Report success
-                        queue.put({'status': 'success', 'key': key})
-
-            # Create download tasks
-            tasks = [download_file(key) for key in process_keys]
-
-            # Wait for all downloads to complete
-            await asyncio.gather(*tasks)
-
-        loop.run_until_complete(download_files_async())
-
-    # Create a queue for process communication
-    manager = multiprocessing.Manager()
-    result_queue = manager.Queue()
-
-    # Start download processes
-    processes_list = []
-    for i in range(processes):
-        if keys_per_process[i]:
-            p = multiprocessing.Process(
-                target=process_worker,
-                args=(keys_per_process[i], result_queue)
-            )
-            p.start()
-            processes_list.append(p)
-
-    # Track progress
-    completed = 0
-    with tqdm(total=len(keys), desc=f"High-perf download (p={processes}, c={concurrency_per_process})") as progress:
-        while completed < len(keys) and any(p.is_alive() for p in processes_list):
-            try:
-                # Check for completed downloads
-                while not result_queue.empty():
-                    result = result_queue.get_nowait()
-                    if result['status'] == 'success':
-                        completed += 1
-                        progress.update(1)
-            except:
-                pass
-            time.sleep(0.1)
-
-    # Wait for processes to finish
-    for p in processes_list:
-        p.join()
-
-    # Final check for any remaining results
-    while not result_queue.empty():
-        try:
-            result = result_queue.get_nowait()
-            if result['status'] == 'success':
-                completed += 1
-        except:
-            pass
-
-    # Calculate statistics
-    end_time = time.time()
-    duration = end_time - start_time
-    mb_per_sec = (total_bytes / (1024 * 1024)) / duration if duration > 0 else 0
-    gbits_per_sec = (mb_per_sec * 8) / 1000
-
-    return {
-        'method': f'high_performance(p={processes},c={concurrency_per_process})',
-        'files_downloaded': completed,
-        'total_bytes': total_bytes,
-        'duration_seconds': duration,
-        'mb_per_second': mb_per_sec,
-        'gbits_per_second': gbits_per_sec
-    }
+    return stats
 
 def run_performance_tests(
     endpoint_url,
@@ -613,16 +446,13 @@ def run_performance_tests(
             # aioboto3
             for concurrency in [10, 25, 50]:
                 print(f"\nTesting aioboto3 (concurrency={concurrency})...")
-                try:
-                    aioboto3_stats = asyncio.run(aioboto3_download_single(
-                        endpoint_url, aws_access_key_id, aws_secret_access_key, region_name,
-                        bucket, size_keys, os.path.join(size_dir, f"aioboto3_{concurrency}"),
-                        max_concurrency=concurrency
-                    ))
-                    aioboto3_stats['file_size_mb'] = size_mb
-                    results.append(aioboto3_stats)
-                except Exception as e:
-                    print(f"Error running aioboto3 test: {str(e)}")
+                aioboto3_stats = asyncio.run(aioboto3_download_single(
+                    endpoint_url, aws_access_key_id, aws_secret_access_key, region_name,
+                    bucket, size_keys, os.path.join(size_dir, f"aioboto3_{concurrency}"),
+                    max_concurrency=concurrency
+                ))
+                aioboto3_stats['file_size_mb'] = size_mb
+                results.append(aioboto3_stats)
 
             # Multiprocessing boto3
             for processes in [2, 4, 8]:
@@ -635,11 +465,11 @@ def run_performance_tests(
                 boto3_mp_stats['file_size_mb'] = size_mb
                 results.append(boto3_mp_stats)
 
-        # High-performance downloader tests (using mock implementation for this example)
+        # High-performance downloader tests
         for processes in processes_list:
             for concurrency in concurrency_list:
                 print(f"\nTesting high-performance downloader (processes={processes}, concurrency={concurrency})...")
-                hp_stats = high_performance_download_mock(
+                hp_stats = high_performance_download(
                     endpoint_url, aws_access_key_id, aws_secret_access_key, region_name,
                     bucket, size_keys, os.path.join(size_dir, f"high_perf_p{processes}_c{concurrency}"),
                     processes=processes,
@@ -665,6 +495,8 @@ def visualize_results(results, output_dir):
 
     # Group results by file size
     size_groups = df.groupby('file_size_mb')
+
+    plt.figure(figsize=(12, 8))
 
     # Plot performance by method for each file size
     for size_mb, group in size_groups:
@@ -734,7 +566,6 @@ def main():
     parser.add_argument('--skip-baseline', action='store_true', help='Skip baseline (slower) methods')
     parser.add_argument('--processes', type=int, nargs='+', default=[1, 2, 4, 8], help='Process counts to test')
     parser.add_argument('--concurrency', type=int, nargs='+', default=[10, 25, 50], help='Concurrency values to test')
-    parser.add_argument('--mock-only', action='store_true', help='Use mock implementation only (no actual high-performance downloader)')
 
     args = parser.parse_args()
 
@@ -745,16 +576,6 @@ def main():
         region_name=args.region
     )
     s3_client = session.client('s3', endpoint_url=args.endpoint_url)
-
-    # Clean up if needed
-    try:
-        if os.path.exists(args.output_dir):
-            shutil.rmtree(args.output_dir)
-        os.makedirs(args.output_dir, exist_ok=True)
-    except Exception as e:
-        print(f"Warning: Could not clean output directory: {str(e)}")
-
-    start_time = time.time()
 
     # Prepare test files if requested
     if args.prepare_files:
@@ -787,6 +608,9 @@ def main():
             if len(keys) > args.files_per_size:
                 file_keys[size] = keys[:args.files_per_size]
 
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
     # Run performance tests
     results = run_performance_tests(
         args.endpoint_url,
@@ -804,9 +628,6 @@ def main():
 
     # Visualize results
     visualize_results(results, args.output_dir)
-
-    total_duration = time.time() - start_time
-    print(f"\nTotal benchmark duration: {total_duration:.2f} seconds")
 
 if __name__ == "__main__":
     main()
