@@ -18,6 +18,7 @@ Key optimizations:
 import os
 import time
 import boto3
+from botocore.config import Config
 import io
 import concurrent.futures
 import threading
@@ -139,8 +140,7 @@ class HighPerformanceS3DownloaderRAMOptimized:
         data_store = manager.dict()
 
         # Get file sizes and calculate optimal distribution
-        session = self._create_session()
-        s3_client = session.client('s3', endpoint_url=self.endpoint_url)
+        session, s3_client = self._create_session()
 
         file_sizes = self._get_file_sizes(s3_client, bucket, keys)
         total_size_gb = sum(file_sizes.values()) / (1024**3)
@@ -212,16 +212,10 @@ class HighPerformanceS3DownloaderRAMOptimized:
 
         return stats
 
-    def _create_session(self) -> boto3.Session:
-        """Create an optimized boto3 session with enhanced network settings"""
-        session = boto3.Session(
-            aws_access_key_id=self.aws_access_key_id,
-            aws_secret_access_key=self.aws_secret_access_key,
-            region_name=self.region_name
-        )
-
-        # Configure session with optimized network settings
-        config = boto3.Config(
+    def _create_session(self) -> Tuple[boto3.Session, boto3.client]:
+        """Create an optimized boto3 session and client with enhanced network settings"""
+        # Create optimized configuration
+        config = Config(
             connect_timeout=self.network_timeout,
             read_timeout=self.network_timeout,
             retries={'max_attempts': self.max_attempts},
@@ -229,7 +223,17 @@ class HighPerformanceS3DownloaderRAMOptimized:
             tcp_keepalive=self.tcp_keepalive
         )
 
-        return session
+        # Create session with credentials
+        session = boto3.Session(
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            region_name=self.region_name
+        )
+
+        # Create client with optimized config
+        client = session.client('s3', endpoint_url=self.endpoint_url, config=config)
+
+        return session, client
 
     def _get_file_sizes(
         self,
@@ -296,8 +300,7 @@ class HighPerformanceS3DownloaderRAMOptimized:
 
         try:
             # Create optimized session and client
-            session = self._create_session()
-            s3_client = session.client('s3', endpoint_url=self.endpoint_url)
+            _, s3_client = self._create_session()
 
             # Calculate optimal concurrency for this process based on file sizes
             total_size = sum(file_sizes[k] for k in keys)
@@ -562,13 +565,8 @@ if __name__ == "__main__":
         verbose=args.verbose
     )
 
-    # List objects in bucket
-    session = boto3.Session(
-        aws_access_key_id=args.access_key,
-        aws_secret_access_key=args.secret_key,
-        region_name=args.region
-    )
-    s3_client = session.client('s3', endpoint_url=args.endpoint_url)
+    # List objects in bucket using optimized client
+    _, s3_client = downloader._create_session()
 
     print(f"Listing objects in bucket '{args.bucket}' with prefix '{args.prefix}'...")
 
