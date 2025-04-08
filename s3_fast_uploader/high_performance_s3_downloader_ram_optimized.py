@@ -418,7 +418,11 @@ class HighPerformanceS3DownloaderRAMOptimized:
                         start_byte,
                         end_byte,
                         file_buffer,
-                        thread_id
+                        thread_id,
+                        result_queue,
+                        process_id,
+                        num_chunks,
+                        file_size
                     )
                     futures.append(future)
 
@@ -468,7 +472,11 @@ class HighPerformanceS3DownloaderRAMOptimized:
         start_byte: int,
         end_byte: int,
         file_buffer: bytearray,
-        thread_id: str
+        thread_id: str,
+        result_queue: Queue,
+        process_id: int,
+        num_chunks: int,
+        file_size: int
     ) -> bool:
         """Download a specific byte range of a file"""
         chunk_size = end_byte - start_byte + 1
@@ -481,8 +489,14 @@ class HighPerformanceS3DownloaderRAMOptimized:
                     Range=f'bytes={start_byte}-{end_byte}'
                 )
 
+                chunk_start_time = time.time()
                 chunk_data = response['Body'].read()
+                chunk_duration = time.time() - chunk_start_time
+
                 file_buffer[start_byte:end_byte + 1] = chunk_data
+
+                # Calculate chunk transfer rate
+                chunk_mb_per_sec = (chunk_size / (1024 * 1024)) / chunk_duration if chunk_duration > 0 else 0
 
                 # Report chunk progress
                 result_queue.put({
@@ -491,7 +505,11 @@ class HighPerformanceS3DownloaderRAMOptimized:
                     'chunk_size': chunk_size,
                     'start_byte': start_byte,
                     'end_byte': end_byte,
-                    'process_id': process_id
+                    'process_id': process_id,
+                    'thread_id': thread_id,
+                    'total_chunks': num_chunks,
+                    'total_size': file_size,
+                    'chunk_mb_per_sec': chunk_mb_per_sec
                 })
 
                 if self.verbose:
@@ -611,9 +629,16 @@ class HighPerformanceS3DownloaderRAMOptimized:
                     elif result['status'] == 'chunk_complete':
                         key = result['key']
                         if key not in chunks_completed:
-                            chunks_completed[key] = {'bytes': 0, 'chunks': 0}
+                            chunks_completed[key] = {
+                                'bytes': 0,
+                                'chunks': 0,
+                                'total_chunks': result.get('total_chunks', 0),
+                                'total_size': result.get('total_size', 0),
+                                'chunk_mb_per_sec': 0
+                            }
                         chunks_completed[key]['bytes'] += result['chunk_size']
                         chunks_completed[key]['chunks'] += 1
+                        chunks_completed[key]['chunk_mb_per_sec'] = result.get('chunk_mb_per_sec', 0)
                         total_bytes += result['chunk_size']
 
                 current_time = time.time()
@@ -636,8 +661,17 @@ class HighPerformanceS3DownloaderRAMOptimized:
                     if chunks_completed:
                         print("\nFiles in progress:")
                         for key, info in chunks_completed.items():
-                            print(f"  {key}: {info['chunks']} chunks, "
-                                  f"{info['bytes'] / (1024*1024):.1f} MB downloaded")
+                            total_chunks = info.get('total_chunks', 0)
+                            current_chunks = info.get('chunks', 0)
+                            downloaded_mb = info.get('bytes', 0) / (1024*1024)
+                            total_mb = info.get('total_size', 0) / (1024*1024)
+                            progress = (downloaded_mb / total_mb * 100) if total_mb > 0 else 0
+
+                            chunk_speed = info.get('chunk_mb_per_sec', 0)
+                            print(f"  {key}:")
+                            print(f"    Progress: {progress:.1f}% ({current_chunks}/{total_chunks} chunks)")
+                            print(f"    Downloaded: {downloaded_mb:.1f} MB / {total_mb:.1f} MB")
+                            print(f"    Speed: {chunk_speed:.2f} MB/s")
 
                     last_report_time = current_time
                     last_bytes = total_bytes
