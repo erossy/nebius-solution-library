@@ -64,8 +64,10 @@ class UltraHighPerformanceS3Downloader:
             read_timeout=network_timeout,
             retries={'max_attempts': max_attempts},
             tcp_keepalive=tcp_keepalive,
-            use_accelerate_endpoint=True,  # Enable transfer acceleration if available
-            s3={'use_accelerate_endpoint': True}
+            s3={
+                'use_accelerate_endpoint': True,  # Enable transfer acceleration if available
+                'addressing_style': 'virtual'  # Use virtual-hosted style addressing
+            }
         )
 
         # Initialize shared statistics
