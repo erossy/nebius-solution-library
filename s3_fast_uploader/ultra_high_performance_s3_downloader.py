@@ -8,7 +8,7 @@ import concurrent.futures
 import threading
 import multiprocessing
 import psutil
-from multiprocessing import Process, Queue, cpu_count, Manager, shared_memory
+from multiprocessing import Process, Queue, cpu_count, Manager, shared_memory, Value
 from typing import List, Optional, Dict, Any, Union, Tuple
 import numpy as np
 import traceback
@@ -16,14 +16,14 @@ import logging
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
-@dataclass
 class DownloadStats:
-    total_bytes: int = 0
-    completed_bytes: int = 0
-    start_time: float = 0
-    completed_files: int = 0
-    failed_files: int = 0
-    current_speed: float = 0
+    def __init__(self):
+        self.total_bytes = Value('q', 0)
+        self.completed_bytes = Value('q', 0)
+        self.start_time = Value('d', 0.0)
+        self.completed_files = Value('i', 0)
+        self.failed_files = Value('i', 0)
+        self.current_speed = Value('d', 0.0)
 
 class UltraHighPerformanceS3Downloader:
     def __init__(
@@ -55,7 +55,13 @@ class UltraHighPerformanceS3Downloader:
         self.chunk_size = chunk_size_mb * 1024 * 1024  # Convert to bytes
         self.max_attempts = max_attempts
         self.verbose = verbose
-        self.memory_limit = memory_limit_gb * 1024 * 1024 * 1024  # Convert to bytes
+
+        # Memory management
+        total_memory = psutil.virtual_memory().total
+        self.memory_limit = min(memory_limit_gb * 1024 * 1024 * 1024, total_memory * 0.9)  # 90% of total RAM
+        self.manager = Manager()
+        self.current_memory_usage = self.manager.Value('q', 0)  # shared counter
+        self._memory_lock = self.manager.Lock()  # shared lock
 
         # Configure boto3 client for maximum performance
         self.config = Config(
@@ -69,10 +75,12 @@ class UltraHighPerformanceS3Downloader:
             }
         )
 
-        # Initialize shared statistics
-        self.manager = Manager()
+        # Initialize shared statistics with multiprocessing Values
         self.stats = DownloadStats()
-        self.stats_lock = threading.Lock()
+        self.stats_lock = self.manager.Lock()
+
+        # Dictionary to store downloaded data
+        self.downloaded_data = self.manager.dict()
 
         # Configure logging
         logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
@@ -119,32 +127,47 @@ class UltraHighPerformanceS3Downloader:
             return False
 
     async def _download_file_async(self, s3_client, bucket: str, key: str, file_size: int):
-        """Download a single file using async I/O and shared memory"""
-        chunk_size = min(self.chunk_size, file_size // (self.threads_per_process * 2))
-        num_chunks = (file_size + chunk_size - 1) // chunk_size
+        """Download a single file using async I/O directly into RAM"""
+        # Check if we have enough memory
+        with self._memory_lock:
+            if self.current_memory_usage.value + file_size > self.memory_limit:
+                raise Exception(f"Not enough memory to download {key} ({file_size} bytes)")
+            self.current_memory_usage.value += file_size
 
-        # Create a buffer for the file data
-        buffer = bytearray(file_size)
-
-        # Create download tasks
-        tasks = []
-        for i in range(num_chunks):
-            start_byte = i * chunk_size
-            end_byte = min(start_byte + chunk_size - 1, file_size - 1)
-            task = self._download_chunk_async(s3_client, bucket, key, start_byte, end_byte, buffer)
-            tasks.append(task)
-
-        # Execute all chunks in parallel
         try:
+            chunk_size = min(self.chunk_size, file_size // (self.threads_per_process * 2))
+            num_chunks = (file_size + chunk_size - 1) // chunk_size
+
+            # Create a buffer in RAM
+            buffer = memoryview(bytearray(file_size))
+
+            # Create download tasks
+            tasks = []
+            for i in range(num_chunks):
+                start_byte = i * chunk_size
+                end_byte = min(start_byte + chunk_size - 1, file_size - 1)
+                task = self._download_chunk_async(s3_client, bucket, key, start_byte, end_byte, buffer)
+                tasks.append(task)
+
+            # Execute all chunks in parallel
             results = await asyncio.gather(*tasks)
             if all(results):
-                return bytes(buffer)
+                # Store the data in shared dictionary
+                data_bytes = bytes(buffer)
+                self.downloaded_data[key] = data_bytes
+                return data_bytes
             else:
                 raise Exception(f"Failed to download all chunks for {key}")
         except Exception as e:
+            # Release memory on error
+            with self._memory_lock:
+                self.current_memory_usage.value -= file_size
             raise Exception(f"Error downloading {key}: {str(e)}")
+        finally:
+            # Release the buffer
+            del buffer
 
-    async def _download_chunk_async(self, s3_client, bucket: str, key: str, start_byte: int, end_byte: int, buffer: bytearray):
+    async def _download_chunk_async(self, s3_client, bucket: str, key: str, start_byte: int, end_byte: int, buffer: memoryview):
         """Download a chunk of data into the buffer"""
         try:
             response = await s3_client.get_object(
@@ -191,8 +214,13 @@ class UltraHighPerformanceS3Downloader:
         finally:
             loop.close()
 
-    def download_files(self, bucket: str, keys: List[str], report_interval_sec: int = 5):
-        """Download multiple files in parallel using processes and async I/O"""
+    def download_files(self, bucket: str, keys: List[str], report_interval_sec: int = 5) -> Dict[str, bytes]:
+        """Download multiple files in parallel using processes and async I/O
+
+        Returns:
+            Dict[str, bytes]: Dictionary mapping file keys to their contents as bytes objects.
+            All data is kept in RAM without touching disk.
+        """
         total_size = 0
         file_sizes = {}
 
@@ -208,8 +236,8 @@ class UltraHighPerformanceS3Downloader:
                 self.logger.error(f"Error getting size for {key}: {str(e)}")
                 continue
 
-        self.stats.total_bytes = total_size
-        self.stats.start_time = time.time()
+        self.stats.total_bytes.value = total_size
+        self.stats.start_time.value = time.time()
 
         # Distribute keys across processes
         chunks = np.array_split(keys, self.processes) if keys else []
@@ -250,23 +278,38 @@ class UltraHighPerformanceS3Downloader:
                     speed = bytes_completed / elapsed if elapsed > 0 else 0
 
                     if self.verbose:
-                        self.logger.info(
-                            f"Progress: {completed_files}/{len(keys)} files, "
-                            f"Speed: {speed/1e9:.2f} GB/s, "
-                            f"Completed: {bytes_completed/1e9:.2f} GB"
-                        )
+                        with self.stats_lock:
+                            self.stats.completed_bytes.value = bytes_completed
+                            self.stats.current_speed.value = speed
+                            self.logger.info(
+                                f"Progress: {completed_files}/{len(keys)} files, "
+                                f"Speed: {speed/1e9:.2f} GB/s, "
+                                f"Completed: {bytes_completed/1e9:.2f} GB"
+                            )
                     last_report_time = current_time
 
-            # Collect results
-            results = {}
+            # Collect results from all processes
             for future in futures:
                 try:
-                    results.update(future.result())
+                    future.result()  # Wait for all processes to complete
                 except Exception as e:
                     self.logger.error(f"Process error: {str(e)}")
 
-            self.stats.completed_files = sum(1 for v in results.values() if v is not None and not isinstance(v, Exception))
-            self.stats.failed_files = sum(1 for v in results.values() if v is None or isinstance(v, Exception))
+            # Get final results from shared dictionary
+            results = {}
+            for key in keys:
+                if key in self.downloaded_data:
+                    results[key] = self.downloaded_data[key]
+
+            # Update statistics
+            with self.stats_lock:
+                self.stats.completed_files.value = len(results)
+                self.stats.failed_files.value = len(keys) - len(results)
+
+            # Clean up memory
+            with self._memory_lock:
+                self.current_memory_usage.value = 0
+            self.downloaded_data.clear()
 
         return results
 
