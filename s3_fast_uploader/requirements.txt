@@ -1,4 +1,4 @@
-aiboto3>=1.0.0
+aioboto3>=1.0.0
 boto3>=1.26.0
 numpy>=1.21.0
 psutil>=5.8.0
