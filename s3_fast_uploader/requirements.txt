@@ -1,0 +1,9 @@
+boto3
+matplotlib
+numpy
+pandas
+aiobotocore
+tqdm
+torch
+tensorflow
+aioboto3

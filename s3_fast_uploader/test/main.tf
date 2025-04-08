@@ -1,10 +1,10 @@
-resource "nebius_compute_v1_instance" "wireguard_instance" {
+resource "nebius_compute_v1_instance" "s3-test-instance" {
   parent_id = var.parent_id
-  name      = "wireguard-instance"
+  name      = "s3-test-instance"
 
   boot_disk = {
     attach_mode   = "READ_WRITE"
-    existing_disk = nebius_compute_v1_disk.wireguard-boot-disk
+    existing_disk = nebius_compute_v1_disk.s3-test-boot-disk
   }
 
   network_interfaces = [
@@ -12,9 +12,7 @@ resource "nebius_compute_v1_instance" "wireguard_instance" {
       name       = "eth0"
       subnet_id  = var.subnet_id
       ip_address = {}
-      public_ip_address = {
-        allocation_id = var.public_ip_allocation_id
-      }
+      public_ip_address = {}
     }
   ]
 
@@ -24,7 +22,7 @@ resource "nebius_compute_v1_instance" "wireguard_instance" {
   }
 
 
-  cloud_init_user_data = templatefile("s3-uploader-cloud-init.tftpl", {
+  cloud_init_user_data = templatefile("templates/s3-uploader-cloud-init.tftpl", {
     ssh_user_name  = var.ssh_user_name,
     ssh_public_key = local.ssh_public_key,
   })
