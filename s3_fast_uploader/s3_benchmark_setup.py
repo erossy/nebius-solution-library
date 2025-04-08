@@ -319,112 +319,184 @@ async def aioboto3_download_single(
     """
     os.makedirs(destination_dir, exist_ok=True)
 
-    # Create session (use aiobotocore directly)
-    session = aiobotocore.get_session()
+    # Create session using the correct API
+    # Try different methods to create the session based on the aiobotocore version
+    try:
+        # First try the Session class directly
+        from aiobotocore.session import AioSession
+        session = AioSession()
+    except (ImportError, AttributeError):
+        try:
+            # Then try the create_client function directly
+            import aiobotocore
+            # We'll create clients directly without session in the rest of the code
+            session = None
+        except:
+            # Last resort, use boto3 session and warn
+            print("Warning: Could not initialize aiobotocore properly. Using boto3 instead.")
+            import boto3
+            session = boto3.Session(
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                region_name=region_name
+            )
+            return standard_boto3_download(
+                endpoint_url, aws_access_key_id, aws_secret_access_key, region_name,
+                bucket, keys, destination_dir
+            )
 
     # First get total size
     total_bytes = 0
     file_sizes = {}
-    async with session.create_client(
-        's3',
-        endpoint_url=endpoint_url,
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        region_name=region_name
-    ) as s3_client:
-        for key in keys:
-            response = await s3_client.head_object(Bucket=bucket, Key=key)
-            size = response['ContentLength']
-            file_sizes[key] = size
-            total_bytes += size
 
-    # Create semaphore to limit concurrency
-    semaphore = asyncio.Semaphore(max_concurrency)
-
-    async def download_file(key):
-        async with semaphore:
-            filename = os.path.basename(key)
-            local_path = os.path.join(destination_dir, filename)
-
-            async with session.create_client(
-                's3',
-                endpoint_url=endpoint_url,
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key,
-                region_name=region_name
-            ) as s3_client:
-                # Stream the response
-                response = await s3_client.get_object(Bucket=bucket, Key=key)
-                with open(local_path, 'wb') as f:
-                    # Read in chunks to handle large files
-                    chunk = await response['Body'].read(8192)  # 8KB chunks
-                    while chunk:
-                        f.write(chunk)
-                        chunk = await response['Body'].read(8192)
-
-            return key
-
-    # Record start time
-    start_time = time.time()
-
-    # Create download tasks
-    tasks = [download_file(key) for key in keys]
-
-    # Track progress with transfer rate display
-    progress = tqdm(total=len(keys), desc=f"Downloading files (async={max_concurrency})")
-    completed_bytes = 0
-    completed_count = 0
-    last_update_time = time.time()
-    update_interval = 0.5  # Update rate info every 0.5 seconds
-
-    # Process tasks as they complete
-    pending = set(tasks)
-    while pending:
-        # Wait for some task to complete
-        done, pending = await asyncio.wait(
-            pending, return_when=asyncio.FIRST_COMPLETED, timeout=0.1
+    # Create client based on what's available
+    if session is None:
+        # Direct client creation
+        s3_client = await aiobotocore.create_client(
+            's3',
+            endpoint_url=endpoint_url,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            region_name=region_name
         )
+        client_context = None  # No context manager
+    else:
+        # Session-based client creation
+        s3_client = await session.create_client(
+            's3',
+            endpoint_url=endpoint_url,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            region_name=region_name
+        ).__aenter__()
+        client_context = s3_client  # For later cleanup
 
-        # Process completed tasks
-        for task in done:
+    try:
+        # Get file sizes
+        for key in keys:
             try:
-                key = task.result()
-                completed_count += 1
-                completed_bytes += file_sizes.get(key, 0)
-
-                # Update rate information periodically
-                current_time = time.time()
-                elapsed = current_time - last_update_time
-
-                if elapsed >= update_interval or completed_count == len(keys):
-                    # Calculate transfer rate
-                    total_elapsed = current_time - start_time
-                    if total_elapsed > 0:
-                        mb_per_sec = (completed_bytes / (1024 * 1024)) / total_elapsed
-                        gbit_per_sec = (mb_per_sec * 8) / 1000
-                        progress.set_postfix({"MB/s": f"{mb_per_sec:.2f}", "Gbit/s": f"{gbit_per_sec:.2f}"})
-                        last_update_time = current_time
-
-                progress.update(1)
+                response = await s3_client.head_object(Bucket=bucket, Key=key)
+                size = response['ContentLength']
+                file_sizes[key] = size
+                total_bytes += size
             except Exception as e:
-                print(f"\nError during async download: {str(e)}")
+                print(f"Error getting size for {key}: {e}")
+                # Use a placeholder size
+                file_sizes[key] = 1024 * 1024  # 1MB placeholder
+                total_bytes += file_sizes[key]
 
-    progress.close()
+        # Create semaphore to limit concurrency
+        semaphore = asyncio.Semaphore(max_concurrency)
 
-    # Calculate final statistics
-    end_time = time.time()
-    duration = end_time - start_time
-    mb_per_sec = (total_bytes / (1024 * 1024)) / duration if duration > 0 else 0
-    gbits_per_sec = (mb_per_sec * 8) / 1000
+        async def download_file(key):
+            async with semaphore:
+                filename = os.path.basename(key)
+                local_path = os.path.join(destination_dir, filename)
 
-    return {
-        'method': f'aioboto3(concurrency={max_concurrency})',
-        'files_downloaded': completed_count,
-        'total_bytes': total_bytes,
-        'duration_seconds': duration,
-        'mb_per_second': mb_per_sec,
-        'gbits_per_second': gbits_per_sec
-    }
+                # Create a new client for each download to avoid issues
+                if session is None:
+                    # Direct client creation
+                    async with aiobotocore.create_client(
+                        's3',
+                        endpoint_url=endpoint_url,
+                        aws_access_key_id=aws_access_key_id,
+                        aws_secret_access_key=aws_secret_access_key,
+                        region_name=region_name
+                    ) as download_client:
+                        # Stream the response
+                        response = await download_client.get_object(Bucket=bucket, Key=key)
+                        with open(local_path, 'wb') as f:
+                            # Read in chunks to handle large files
+                            chunk = await response['Body'].read(8192)  # 8KB chunks
+                            while chunk:
+                                f.write(chunk)
+                                chunk = await response['Body'].read(8192)
+                else:
+                    # Session-based client creation
+                    async with session.create_client(
+                        's3',
+                        endpoint_url=endpoint_url,
+                        aws_access_key_id=aws_access_key_id,
+                        aws_secret_access_key=aws_secret_access_key,
+                        region_name=region_name
+                    ) as download_client:
+                        # Stream the response
+                        response = await download_client.get_object(Bucket=bucket, Key=key)
+                        with open(local_path, 'wb') as f:
+                            # Read in chunks to handle large files
+                            chunk = await response['Body'].read(8192)  # 8KB chunks
+                            while chunk:
+                                f.write(chunk)
+                                chunk = await response['Body'].read(8192)
+
+                return key
+
+        # Record start time
+        start_time = time.time()
+
+        # Create download tasks
+        tasks = [asyncio.create_task(download_file(key)) for key in keys]
+
+        # Track progress with transfer rate display
+        progress = tqdm(total=len(keys), desc=f"Downloading files (async={max_concurrency})")
+        completed_bytes = 0
+        completed_count = 0
+        last_update_time = time.time()
+        update_interval = 0.5  # Update rate info every 0.5 seconds
+
+        # Process tasks as they complete
+        pending = set(tasks)
+        while pending:
+            # Wait for some task to complete
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED, timeout=0.1
+            )
+
+            # Process completed tasks
+            for task in done:
+                try:
+                    key = task.result()
+                    completed_count += 1
+                    completed_bytes += file_sizes.get(key, 0)
+
+                    # Update rate information periodically
+                    current_time = time.time()
+                    elapsed = current_time - last_update_time
+
+                    if elapsed >= update_interval or completed_count == len(keys):
+                        # Calculate transfer rate
+                        total_elapsed = current_time - start_time
+                        if total_elapsed > 0:
+                            mb_per_sec = (completed_bytes / (1024 * 1024)) / total_elapsed
+                            gbit_per_sec = (mb_per_sec * 8) / 1000
+                            progress.set_postfix({"MB/s": f"{mb_per_sec:.2f}", "Gbit/s": f"{gbit_per_sec:.2f}"})
+                            last_update_time = current_time
+
+                    progress.update(1)
+                except Exception as e:
+                    print(f"\nError during async download: {str(e)}")
+
+        progress.close()
+
+        # Calculate final statistics
+        end_time = time.time()
+        duration = end_time - start_time
+        mb_per_sec = (total_bytes / (1024 * 1024)) / duration if duration > 0 else 0
+        gbits_per_sec = (mb_per_sec * 8) / 1000
+
+        return {
+            'method': f'aioboto3(concurrency={max_concurrency})',
+            'files_downloaded': completed_count,
+            'total_bytes': total_bytes,
+            'duration_seconds': duration,
+            'mb_per_second': mb_per_sec,
+            'gbits_per_second': gbits_per_sec
+        }
+
+    finally:
+        # Clean up the client if needed
+        if client_context:
+            await client_context.__aexit__(None, None, None)
 
     progress.close()
 
@@ -502,70 +574,104 @@ def boto3_multiprocess_download(
         file_sizes[key] = size
         total_bytes += size
 
-    # Prepare arguments for multiprocessing
-    args = [(key, bucket, endpoint_url, aws_access_key_id, aws_secret_access_key, region_name, destination_dir) for key in keys]
+    # Distribute files among processes
+    keys_per_process = [[] for _ in range(processes)]
+    for i, key in enumerate(keys):
+        keys_per_process[i % processes].append(key)
 
-    # For progress tracking with transfer rate
+    # Define a worker function that each process will run
+    def worker_process(process_keys, result_queue):
+        # Create a new session in this process
+        session = boto3.Session(
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            region_name=region_name
+        )
+        s3_client = session.client('s3', endpoint_url=endpoint_url)
+
+        for key in process_keys:
+            try:
+                filename = os.path.basename(key)
+                local_path = os.path.join(destination_dir, filename)
+                s3_client.download_file(bucket, key, local_path)
+                result_queue.put(('success', key))
+            except Exception as e:
+                result_queue.put(('error', key, str(e)))
+
+    # Create a queue for results
     manager = multiprocessing.Manager()
     result_queue = manager.Queue()
-    completed_bytes = 0
-    completed_files = 0
-    last_update_time = time.time()
-    update_interval = 0.5  # Update rate display every 0.5 seconds
 
-    # Modified helper function to report back when done
-    def download_file_with_reporting(args):
-        key, bucket, endpoint_url, aws_access_key_id, aws_secret_access_key, region_name, destination_dir = args
-        try:
-            result = multiprocess_download_helper(args)
-            result_queue.put(('success', key))
-            return result
-        except Exception as e:
-            result_queue.put(('error', key, str(e)))
-            raise
-
+    # Start the worker processes
     start_time = time.time()
+    workers = []
+    for i in range(processes):
+        if keys_per_process[i]:  # Only start processes that have work to do
+            p = multiprocessing.Process(
+                target=worker_process,
+                args=(keys_per_process[i], result_queue)
+            )
+            p.daemon = True  # Make sure processes exit if main process crashes
+            p.start()
+            workers.append(p)
 
-    # Download files using multiprocessing
-    with multiprocessing.Pool(processes=processes) as pool:
-        # Start the async tasks
-        async_results = pool.map_async(download_file_with_reporting, args)
+    # Monitor progress
+    completed_files = 0
+    completed_bytes = 0
+    last_update_time = time.time()
+    update_interval = 0.5
 
-        # Track progress with transfer rate
-        with tqdm(total=len(keys), desc=f"Downloading files (processes={processes})") as pbar:
-            while not async_results.ready() or completed_files < len(keys):
-                # Check result queue for completed downloads
-                while not result_queue.empty():
-                    try:
-                        result = result_queue.get_nowait()
-                        if result[0] == 'success':
-                            key = result[1]
-                            completed_files += 1
-                            completed_bytes += file_sizes.get(key, 0)
-                    except:
-                        pass
+    with tqdm(total=len(keys), desc=f"Downloading files (processes={processes})") as pbar:
+        # Continue until all files are processed or all processes are dead
+        while completed_files < len(keys) and any(p.is_alive() for p in workers):
+            # Check for results
+            while not result_queue.empty():
+                try:
+                    result = result_queue.get_nowait()
+                    if result[0] == 'success':
+                        key = result[1]
+                        completed_files += 1
+                        completed_bytes += file_sizes.get(key, 0)
+                    else:  # Error case
+                        key, error = result[1], result[2]
+                        print(f"\nError downloading {key}: {error}")
+                except Exception:
+                    # Just continue if there's an issue with the queue
+                    pass
 
-                # Update progress display with transfer rate
-                current_time = time.time()
-                elapsed = current_time - last_update_time
+            # Update progress display
+            current_time = time.time()
+            elapsed = current_time - last_update_time
 
-                if elapsed >= update_interval:
-                    # Calculate transfer rate
-                    total_elapsed = current_time - start_time
-                    if total_elapsed > 0 and completed_bytes > 0:
-                        mb_per_sec = (completed_bytes / (1024 * 1024)) / total_elapsed
-                        gbit_per_sec = (mb_per_sec * 8) / 1000
-                        pbar.set_postfix({"MB/s": f"{mb_per_sec:.2f}", "Gbit/s": f"{gbit_per_sec:.2f}"})
-                        last_update_time = current_time
+            if elapsed >= update_interval:
+                # Calculate transfer rate
+                total_elapsed = current_time - start_time
+                if total_elapsed > 0 and completed_bytes > 0:
+                    mb_per_sec = (completed_bytes / (1024 * 1024)) / total_elapsed
+                    gbit_per_sec = (mb_per_sec * 8) / 1000
+                    pbar.set_postfix({"MB/s": f"{mb_per_sec:.2f}", "Gbit/s": f"{gbit_per_sec:.2f}"})
+                    last_update_time = current_time
 
-                # Update progress bar to show completed files
-                pbar.n = completed_files
-                pbar.refresh()
+            # Update the progress bar
+            pbar.n = completed_files
+            pbar.refresh()
 
-                if async_results.ready() and completed_files >= len(keys):
-                    break
+            # Short sleep to prevent CPU spinning
+            time.sleep(0.1)
 
-                time.sleep(0.1)
+    # Check for any remaining results
+    while not result_queue.empty():
+        try:
+            result = result_queue.get_nowait()
+            if result[0] == 'success':
+                completed_files += 1
+        except:
+            pass
+
+    # Ensure all processes are terminated
+    for p in workers:
+        if p.is_alive():
+            p.terminate()
 
     end_time = time.time()
     duration = end_time - start_time
@@ -574,7 +680,7 @@ def boto3_multiprocess_download(
 
     return {
         'method': f'boto3_multiprocess(processes={processes})',
-        'files_downloaded': len(keys),
+        'files_downloaded': completed_files,
         'total_bytes': total_bytes,
         'duration_seconds': duration,
         'mb_per_second': mb_per_sec,
