@@ -118,47 +118,78 @@ class UltraHighPerformanceS3Downloader:
             self.logger.error(f"Error downloading chunk {start_byte}-{end_byte} of {key}: {str(e)}")
             return False
 
-    async def _download_file_async(self, bucket: str, key: str, file_size: int):
+    async def _download_file_async(self, s3_client, bucket: str, key: str, file_size: int):
         """Download a single file using async I/O and shared memory"""
-        chunks = []
         chunk_size = min(self.chunk_size, file_size // (self.threads_per_process * 2))
         num_chunks = (file_size + chunk_size - 1) // chunk_size
 
-        # Create shared memory for the entire file
-        shm = shared_memory.SharedMemory(create=True, size=file_size)
-
-        # Create async S3 client
-        s3_client = aioboto3.client(
-            's3',
-            aws_access_key_id=self.aws_access_key_id,
-            aws_secret_access_key=self.aws_secret_access_key,
-            endpoint_url=self.endpoint_url,
-            region_name=self.region_name,
-            config=self.config
-        )
+        # Create a buffer for the file data
+        buffer = bytearray(file_size)
 
         # Create download tasks
         tasks = []
         for i in range(num_chunks):
             start_byte = i * chunk_size
             end_byte = min(start_byte + chunk_size - 1, file_size - 1)
-            task = self._download_chunk_async(s3_client, bucket, key, start_byte, end_byte, 
-                                            shm.name, start_byte)
+            task = self._download_chunk_async(s3_client, bucket, key, start_byte, end_byte, buffer)
             tasks.append(task)
 
         # Execute all chunks in parallel
-        results = await asyncio.gather(*tasks)
+        try:
+            results = await asyncio.gather(*tasks)
+            if all(results):
+                return bytes(buffer)
+            else:
+                raise Exception(f"Failed to download all chunks for {key}")
+        except Exception as e:
+            raise Exception(f"Error downloading {key}: {str(e)}")
 
-        # Check if all chunks downloaded successfully
-        if all(results):
-            # Create a numpy array from shared memory
-            data = np.ndarray(file_size, dtype=np.uint8, buffer=shm.buf)
-            return data.tobytes()
-        else:
-            raise Exception(f"Failed to download all chunks for {key}")
+    async def _download_chunk_async(self, s3_client, bucket: str, key: str, start_byte: int, end_byte: int, buffer: bytearray):
+        """Download a chunk of data into the buffer"""
+        try:
+            response = await s3_client.get_object(
+                Bucket=bucket,
+                Key=key,
+                Range=f'bytes={start_byte}-{end_byte}'
+            )
 
-        shm.close()
-        shm.unlink()
+            chunk_data = await response['Body'].read()
+            buffer[start_byte:end_byte + 1] = chunk_data
+            return True
+        except Exception as e:
+            self.logger.error(f"Error downloading chunk {start_byte}-{end_byte} of {key}: {str(e)}")
+            return False
+
+    async def _process_download_async(self, bucket: str, keys: List[str], file_sizes: Dict[str, int]):
+        """Process a batch of downloads asynchronously"""
+        async with aioboto3.client(
+            's3',
+            endpoint_url=self.endpoint_url,
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            region_name=self.region_name,
+            config=self.config
+        ) as s3_client:
+            tasks = []
+            for key in keys:
+                if key in file_sizes:
+                    task = self._download_file_async(s3_client, bucket, key, file_sizes[key])
+                    tasks.append(task)
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            return dict(zip(keys, results))
+
+    def _process_worker(self, bucket: str, keys: List[str], file_sizes: Dict[str, int]):
+        """Worker function for each process"""
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(self._process_download_async(bucket, keys, file_sizes))
+        except Exception as e:
+            self.logger.error(f"Process worker error: {str(e)}")
+            return {}
+        finally:
+            loop.close()
 
     def download_files(self, bucket: str, keys: List[str], report_interval_sec: int = 5):
         """Download multiple files in parallel using processes and async I/O"""
@@ -180,45 +211,62 @@ class UltraHighPerformanceS3Downloader:
         self.stats.total_bytes = total_size
         self.stats.start_time = time.time()
 
+        # Distribute keys across processes
+        chunks = np.array_split(keys, self.processes) if keys else []
+
         # Create process pool for parallel downloads
         with ProcessPoolExecutor(max_workers=self.processes) as executor:
             futures = []
-            for key in keys:
-                if key in file_sizes:
-                    future = executor.submit(
-                        asyncio.run,
-                        self._download_file_async(bucket, key, file_sizes[key])
-                    )
-                    futures.append((key, future))
+            for chunk in chunks:
+                future = executor.submit(
+                    self._process_worker,
+                    bucket,
+                    chunk.tolist(),
+                    file_sizes
+                )
+                futures.append(future)
 
             # Monitor progress
-            completed = 0
-            while completed < len(futures):
-                completed = sum(1 for _, f in futures if f.done())
-                bytes_completed = sum(
-                    file_sizes[key] for key, f in futures 
-                    if f.done() and not f.exception()
-                )
+            completed_files = 0
+            bytes_completed = 0
+            start_time = time.time()
+            last_report_time = start_time
 
-                elapsed = time.time() - self.stats.start_time
-                speed = bytes_completed / elapsed if elapsed > 0 else 0
+            while completed_files < len(keys):
+                time.sleep(0.1)  # Prevent busy waiting
+                completed_files = 0
+                bytes_completed = 0
 
-                if self.verbose and elapsed >= report_interval_sec:
-                    self.logger.info(
-                        f"Progress: {completed}/{len(futures)} files, "
-                        f"Speed: {speed/1e9:.2f} GB/s, "
-                        f"Completed: {bytes_completed/1e9:.2f} GB"
-                    )
+                # Calculate progress
+                for future in futures:
+                    if future.done() and not future.exception():
+                        result = future.result()
+                        completed_files += sum(1 for k, v in result.items() if v is not None and not isinstance(v, Exception))
+                        bytes_completed += sum(file_sizes[k] for k, v in result.items() if v is not None and not isinstance(v, Exception))
+
+                current_time = time.time()
+                if current_time - last_report_time >= report_interval_sec:
+                    elapsed = current_time - start_time
+                    speed = bytes_completed / elapsed if elapsed > 0 else 0
+
+                    if self.verbose:
+                        self.logger.info(
+                            f"Progress: {completed_files}/{len(keys)} files, "
+                            f"Speed: {speed/1e9:.2f} GB/s, "
+                            f"Completed: {bytes_completed/1e9:.2f} GB"
+                        )
+                    last_report_time = current_time
 
             # Collect results
             results = {}
-            for key, future in futures:
+            for future in futures:
                 try:
-                    results[key] = future.result()
-                    self.stats.completed_files += 1
+                    results.update(future.result())
                 except Exception as e:
-                    self.logger.error(f"Error downloading {key}: {str(e)}")
-                    self.stats.failed_files += 1
+                    self.logger.error(f"Process error: {str(e)}")
+
+            self.stats.completed_files = sum(1 for v in results.values() if v is not None and not isinstance(v, Exception))
+            self.stats.failed_files = sum(1 for v in results.values() if v is None or isinstance(v, Exception))
 
         return results
 
