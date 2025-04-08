@@ -44,6 +44,7 @@ class HighPerformanceS3DownloaderRAMOptimized:
         processes: int = None,
         concurrency_per_process: int = None,
         multipart_size_mb: int = 128,  # Increased for better throughput
+        chunk_threshold_mb: int = 1024,  # Files larger than this will use parallel downloading
         max_attempts: int = 5,
         verbose: bool = True,
         memory_limit_gb: float = 1500,  # Leave some RAM for system
@@ -62,6 +63,7 @@ class HighPerformanceS3DownloaderRAMOptimized:
             processes: Number of processes (defaults to CPU count - 4)
             concurrency_per_process: Concurrent downloads per process (auto-calculated)
             multipart_size_mb: Size of multipart chunks in MB
+            chunk_threshold_mb: Files larger than this will use parallel downloading (MB)
             max_attempts: Maximum number of retry attempts
             verbose: Whether to print detailed information
             memory_limit_gb: Maximum RAM usage in GB
@@ -106,6 +108,7 @@ class HighPerformanceS3DownloaderRAMOptimized:
             print(f"    Processes: {self.processes}")
             print(f"    Concurrency per process: {self.concurrency_per_process}")
             print(f"    Multipart chunk size: {self.multipart_size_mb} MB")
+            print(f"    Parallel threshold: {self.chunk_threshold_mb} MB")
             print(f"    Memory limit: {self.memory_limit_gb} GB")
             print(f"    Network timeout: {self.network_timeout}s")
             print(f"    TCP keepalive: {self.tcp_keepalive}")
@@ -354,7 +357,166 @@ class HighPerformanceS3DownloaderRAMOptimized:
         process_id: int,
         file_size: int
     ):
-        """Download a single file with optimized parameters"""
+        """Download a single file with optimized parameters, using parallel downloads for large files"""
+        # For large files (>chunk_threshold_mb), use parallel chunk downloading
+        LARGE_FILE_THRESHOLD = self.chunk_threshold_mb * 1024 * 1024
+        if file_size > LARGE_FILE_THRESHOLD:
+            return self._download_large_file(
+                s3_client, bucket, key, data_store, result_queue, process_id, file_size
+            )
+        else:
+            return self._download_single_file(
+                s3_client, bucket, key, data_store, result_queue, process_id, file_size
+            )
+
+    def _download_large_file(
+        self,
+        s3_client: boto3.client,
+        bucket: str,
+        key: str,
+        data_store: Dict,
+        result_queue: Queue,
+        process_id: int,
+        file_size: int
+    ):
+        """Download a large file in parallel chunks"""
+        thread_id = f"Process-{process_id}-Thread-{threading.get_ident()}"
+
+        try:
+            start_time = time.time()
+
+            # Calculate optimal chunk size and number of chunks
+            chunk_size = max(
+                self.multipart_size_mb * 1024 * 1024,
+                min(file_size // (self.processes * 2), 256 * 1024 * 1024)  # Max 256MB chunks
+            )
+            num_chunks = (file_size + chunk_size - 1) // chunk_size
+
+            if self.verbose:
+                print(f"[{thread_id}] Downloading {key} in {num_chunks} chunks "
+                      f"of {chunk_size / (1024*1024):.1f}MB each")
+
+            # Pre-allocate buffer for the entire file
+            file_buffer = bytearray(file_size)
+
+            # Download chunks in parallel
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(num_chunks, self.concurrency_per_process)
+            ) as executor:
+                futures = []
+
+                for chunk_index in range(num_chunks):
+                    start_byte = chunk_index * chunk_size
+                    end_byte = min(start_byte + chunk_size, file_size) - 1
+
+                    future = executor.submit(
+                        self._download_chunk,
+                        s3_client,
+                        bucket,
+                        key,
+                        start_byte,
+                        end_byte,
+                        file_buffer,
+                        thread_id
+                    )
+                    futures.append(future)
+
+                # Wait for all chunks to complete
+                for future in concurrent.futures.as_completed(futures):
+                    if not future.result():
+                        raise Exception("Chunk download failed")
+
+            # Store the complete file
+            data_store[key] = bytes(file_buffer)
+
+            duration = time.time() - start_time
+            mb_per_sec = (file_size / (1024 * 1024)) / duration if duration > 0 else 0
+
+            result_queue.put({
+                'status': 'success',
+                'key': key,
+                'size': file_size,
+                'duration': duration,
+                'mb_per_sec': mb_per_sec,
+                'process_id': process_id,
+                'chunks': num_chunks
+            })
+
+            if self.verbose:
+                print(f"[{thread_id}] Downloaded {key} ({file_size / (1024 * 1024):.2f} MB) "
+                      f"in {num_chunks} chunks at {mb_per_sec:.2f} MB/s")
+
+            return True
+
+        except Exception as e:
+            print(f"[{thread_id}] Error downloading {key} in parallel: {e}")
+            traceback.print_exc()
+            result_queue.put({
+                'status': 'error',
+                'key': key,
+                'error': str(e),
+                'process_id': process_id
+            })
+            return False
+
+    def _download_chunk(
+        self,
+        s3_client: boto3.client,
+        bucket: str,
+        key: str,
+        start_byte: int,
+        end_byte: int,
+        file_buffer: bytearray,
+        thread_id: str
+    ) -> bool:
+        """Download a specific byte range of a file"""
+        chunk_size = end_byte - start_byte + 1
+
+        for attempt in range(self.max_attempts):
+            try:
+                response = s3_client.get_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Range=f'bytes={start_byte}-{end_byte}'
+                )
+
+                chunk_data = response['Body'].read()
+                file_buffer[start_byte:end_byte + 1] = chunk_data
+
+                # Report chunk progress
+                result_queue.put({
+                    'status': 'chunk_complete',
+                    'key': key,
+                    'chunk_size': chunk_size,
+                    'start_byte': start_byte,
+                    'end_byte': end_byte,
+                    'process_id': process_id
+                })
+
+                if self.verbose:
+                    print(f"[{thread_id}] Downloaded chunk {start_byte}-{end_byte} "
+                          f"({chunk_size / (1024*1024):.1f}MB)")
+
+                return True
+
+            except Exception as e:
+                print(f"[{thread_id}] Error downloading chunk {start_byte}-{end_byte}: {e}")
+                if attempt < self.max_attempts - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    return False
+
+    def _download_single_file(
+        self,
+        s3_client: boto3.client,
+        bucket: str,
+        key: str,
+        data_store: Dict,
+        result_queue: Queue,
+        process_id: int,
+        file_size: int
+    ):
+        """Download a single file without parallelization"""
         thread_id = f"Process-{process_id}-Thread-{threading.get_ident()}"
 
         for attempt in range(self.max_attempts):
@@ -438,8 +600,19 @@ class HighPerformanceS3DownloaderRAMOptimized:
                     if result['status'] == 'success':
                         completed += 1
                         total_bytes += result.get('size', 0)
+                        if result.get('key') in chunks_completed:
+                            del chunks_completed[result['key']]
                     elif result['status'] == 'error':
                         errors += 1
+                        if result.get('key') in chunks_completed:
+                            del chunks_completed[result['key']]
+                    elif result['status'] == 'chunk_complete':
+                        key = result['key']
+                        if key not in chunks_completed:
+                            chunks_completed[key] = {'bytes': 0, 'chunks': 0}
+                        chunks_completed[key]['bytes'] += result['chunk_size']
+                        chunks_completed[key]['chunks'] += 1
+                        total_bytes += result['chunk_size']
 
                 current_time = time.time()
                 if current_time - last_report_time >= report_interval_sec:
@@ -456,6 +629,13 @@ class HighPerformanceS3DownloaderRAMOptimized:
                     print(f"Throughput: {recent_throughput:.2f} MB/s (recent), "
                           f"{overall_throughput:.2f} MB/s (average)")
                     print(f"Memory: {memory_used:.1f} GB used, {memory_available:.1f} GB available")
+
+                    # Show chunk progress for files in progress
+                    if chunks_completed:
+                        print("\nFiles in progress:")
+                        for key, info in chunks_completed.items():
+                            print(f"  {key}: {info['chunks']} chunks, "
+                                  f"{info['bytes'] / (1024*1024):.1f} MB downloaded")
 
                     last_report_time = current_time
                     last_bytes = total_bytes
@@ -544,6 +724,7 @@ if __name__ == "__main__":
     parser.add_argument('--processes', type=int, default=None, help='Number of processes to use')
     parser.add_argument('--concurrency', type=int, default=None, help='Concurrent downloads per process')
     parser.add_argument('--multipart-size-mb', type=int, default=128, help='Multipart chunk size in MB')
+    parser.add_argument('--chunk-threshold-mb', type=int, default=512, help='Files larger than this will use parallel downloading (MB)')
     parser.add_argument('--memory-limit-gb', type=float, default=1500, help='Maximum RAM usage in GB')
     parser.add_argument('--report-interval', type=int, default=5, help='Progress reporting interval in seconds')
     parser.add_argument('--max-files', type=int, default=None, help='Maximum number of files to download')
@@ -561,6 +742,7 @@ if __name__ == "__main__":
         processes=args.processes,
         concurrency_per_process=args.concurrency,
         multipart_size_mb=args.multipart_size_mb,
+        chunk_threshold_mb=args.chunk_threshold_mb,
         memory_limit_gb=args.memory_limit_gb,
         verbose=args.verbose
     )
