@@ -590,6 +590,7 @@ class HighPerformanceS3DownloaderRAMOptimized:
         completed = 0
         errors = 0
         total_bytes = 0
+        chunks_completed = {}  # Track chunks per file
         start_time = time.time()
         last_report_time = start_time
         last_bytes = 0
