@@ -33,16 +33,6 @@ def prepare_test_files(
 ):
   """
   Generate and upload test files of specific sizes to S3 bucket.
-
-  Args:
-      s3_client: Boto3 S3 client
-      bucket_name: Target S3 bucket name
-      prefix: Key prefix for test files
-      file_sizes_mb: List of file sizes in MB to generate
-      num_files_per_size: Number of files to generate for each size
-
-  Returns:
-      Dictionary mapping file size to list of keys
   """
   import io
   import random
@@ -52,20 +42,66 @@ def prepare_test_files(
 
   for size_mb in file_sizes_mb:
     for i in range(num_files_per_size):
-      # Generate a random binary file of the specified size
-      # Using random data to prevent compression benefits
-      random_bytes = random.randbytes(size_mb * 1024 * 1024)
-      data = io.BytesIO(random_bytes)
-
       # Create a key with size in the name
       key = f"{prefix}/test_{size_mb}mb_{i}.bin"
-
       print(f"Uploading {key} ({size_mb} MB)...")
-      s3_client.upload_fileobj(data, bucket_name, key)
-      file_keys[size_mb].append(key)
+
+      # Create file in chunks to avoid memory issues
+      chunk_size_mb = 10  # Use smaller chunks
+      total_chunks = size_mb // chunk_size_mb
+      if size_mb % chunk_size_mb != 0:
+        total_chunks += 1
+
+      # Upload in chunks using multipart upload
+      mpu = s3_client.create_multipart_upload(Bucket=bucket_name, Key=key)
+      parts = []
+
+      try:
+        for chunk_idx in range(total_chunks):
+          # Last chunk might be smaller
+          current_chunk_size = min(chunk_size_mb, size_mb - (chunk_idx * chunk_size_mb))
+          chunk_bytes = random.randbytes(current_chunk_size * 1024 * 1024)
+
+          # Upload part
+          part_number = chunk_idx + 1
+          response = s3_client.upload_part(
+            Bucket=bucket_name,
+            Key=key,
+            PartNumber=part_number,
+            UploadId=mpu['UploadId'],
+            Body=chunk_bytes
+          )
+
+          # Save ETag for completion
+          parts.append({
+            'PartNumber': part_number,
+            'ETag': response['ETag']
+          })
+
+          print(f"  Uploaded part {part_number}/{total_chunks} for {key}")
+
+        # Complete multipart upload
+        s3_client.complete_multipart_upload(
+          Bucket=bucket_name,
+          Key=key,
+          UploadId=mpu['UploadId'],
+          MultipartUpload={'Parts': parts}
+        )
+
+        file_keys[size_mb].append(key)
+        print(f"  Completed upload of {key}")
+
+      except Exception as e:
+        # Abort upload if something goes wrong
+        s3_client.abort_multipart_upload(
+          Bucket=bucket_name,
+          Key=key,
+          UploadId=mpu['UploadId']
+        )
+        print(f"  Error uploading {key}: {str(e)}")
+        raise
 
   return file_keys
-
 
 def standard_boto3_download(
   endpoint_url,
