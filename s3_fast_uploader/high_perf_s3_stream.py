@@ -174,6 +174,7 @@ class HighThroughputS3Downloader:
         start_time, stop_reporting, download_bytes, completed_count, failed_count,
         len(all_chunks), total_size_bytes
       )
+    )
 
     # Create manager for shared dictionary
     manager = Manager()
