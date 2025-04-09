@@ -98,13 +98,28 @@ class S3FastDownloader:
         self.num_processes = num_processes or cpu_count()
 
         # Configure boto3 for maximum performance
+        # Calculate optimal connection pool size based on system resources
+        optimal_pool_size = min(
+            max(100, max_concurrency * cpu_count() * 4),  # Scale with CPU and concurrency
+            2000  # Maximum of 2000 connections for high throughput
+        )
+
+        # Log system resources and configuration
+        logger.info("System Configuration:")
+        logger.info(f"- CPU cores: {cpu_count()}")
+        logger.info(f"- Max concurrency: {max_concurrency}")
+        logger.info(f"- Connection pool size: {optimal_pool_size}")
+        memory = psutil.virtual_memory()
+        logger.info(f"- Available memory: {memory.available / (1024**3):.1f} GB")
+
         config_params = {
-            'max_pool_connections': 50,  # Increase connection pool size
+            'max_pool_connections': optimal_pool_size,
             'retries': {'max_attempts': max_retries},
             'tcp_keepalive': True,
             'read_timeout': 300,  # 5 minutes
             'connect_timeout': 300,  # 5 minutes
         }
+        logger.info(f"Configured connection pool with {optimal_pool_size} connections")
 
         # Enable S3 Transfer Acceleration only when using standard AWS S3 (no custom endpoint)
         if not endpoint_url:
@@ -147,8 +162,13 @@ class S3FastDownloader:
         # Dictionary to store downloaded files in memory
         self.files_in_memory = {}
 
-        # Initialize thread pool for concurrent operations
-        self.thread_pool = ThreadPoolExecutor(max_workers=max_concurrency)
+        # Initialize thread pool for concurrent operations within batches
+        thread_pool_size = min(
+            max(cpu_count() * 4, max_concurrency),  # At least 4 threads per CPU
+            128  # Cap at 128 threads
+        )
+        self.thread_pool = ThreadPoolExecutor(max_workers=thread_pool_size)
+        logger.info(f"- Thread pool size: {thread_pool_size}")
 
         # Register cleanup on exit
         atexit.register(self.cleanup)
@@ -250,39 +270,201 @@ class S3FastDownloader:
 
         logger.info(f"Total download size: {total_size / (1024*1024):.2f} MB")
 
-        # Process files in batches to prevent memory overload
-        results = {}
-        for i in range(0, len(file_keys), batch_size):
-            batch = file_keys[i:i + batch_size]
-            batch_size_mb = sum(file_sizes[key] for key in batch) / (1024*1024)
-            logger.info(f"Processing batch {i//batch_size + 1}, size: {batch_size_mb:.2f} MB")
+        # Calculate optimal number of concurrent batches based on available memory and CPU
+        memory = psutil.virtual_memory()
+        available_memory = memory.available
+        avg_file_size = total_size / len(file_keys)
+        max_concurrent_batches = min(
+            max(1, int(available_memory / (avg_file_size * batch_size * 2))),  # Based on memory
+            max(1, cpu_count()),  # Use all CPU cores
+            16  # Cap at 16 concurrent batches
+        )
 
-            # Submit batch of downloads to thread pool
+        # Log batch processing configuration
+        logger.info("\nBatch Processing Configuration:")
+        logger.info(f"- Concurrent batches: {max_concurrent_batches}")
+        logger.info(f"- Batch size: {batch_size}")
+        logger.info(f"- Average file size: {avg_file_size / (1024*1024):.2f} MB")
+        logger.info(f"- Total files: {len(file_keys)}")
+        logger.info(f"- Total size: {total_size / (1024*1024*1024):.2f} GB")
+
+        # Process files in parallel batches
+        results = {}
+        failed_downloads = []
+        start_time = time.time()
+        total_downloaded_size = 0
+
+        with ThreadPoolExecutor(max_workers=max_concurrent_batches) as batch_executor:
+            # Submit batches for parallel processing
+            batch_futures = []
+            for i in range(0, len(file_keys), batch_size):
+                batch = file_keys[i:i + batch_size]
+                batch_futures.append(batch_executor.submit(
+                    self._process_batch, batch, i//batch_size + 1, file_sizes
+                ))
+
+            # Track overall progress
+            with tqdm(total=len(file_keys), desc="Total Progress") as total_pbar:
+                for future in as_completed(batch_futures):
+                    try:
+                        batch_results = future.result()
+                        results.update(batch_results)
+
+                        # Update progress and statistics
+                        successful_files = len(batch_results)
+                        total_pbar.update(successful_files)
+
+                        # Calculate downloaded size and speed
+                        batch_size = sum(file_sizes[key] for key in batch_results.keys())
+                        total_downloaded_size += batch_size
+                        elapsed = time.time() - start_time
+                        current_speed = total_downloaded_size / elapsed / (1024*1024) if elapsed > 0 else 0
+
+                        total_pbar.set_postfix({
+                            'Speed': f'{current_speed:.1f} MB/s',
+                            'Success': f'{len(results)}/{len(file_keys)}'
+                        })
+
+                    except Exception as e:
+                        logger.error(f"Batch processing error: {str(e)}")
+                        failed_downloads.extend(batch)
+
+        # Calculate final statistics
+        end_time = time.time()
+        total_time = end_time - start_time
+        avg_speed = total_downloaded_size / total_time / (1024*1024) if total_time > 0 else 0
+        success_rate = len(results) / len(file_keys) * 100
+
+        # Get system resource usage
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        memory_used = memory.used / (1024*1024*1024)  # GB
+        memory_available = memory.available / (1024*1024*1024)  # GB
+
+        # Print performance summary
+        logger.info("\nDownload Summary:")
+        logger.info("-" * 50)
+        logger.info("Files:")
+        logger.info(f"- Total processed: {len(file_keys)}")
+        logger.info(f"- Successfully downloaded: {len(results)}")
+        logger.info(f"- Failed downloads: {len(failed_downloads)}")
+        logger.info(f"- Success rate: {success_rate:.1f}%")
+
+        logger.info("\nPerformance:")
+        logger.info(f"- Total time: {total_time:.1f} seconds")
+        logger.info(f"- Average speed: {avg_speed:.1f} MB/s")
+        logger.info(f"- Total data transferred: {total_downloaded_size / (1024*1024*1024):.2f} GB")
+
+        logger.info("\nSystem Resources:")
+        logger.info(f"- CPU Usage: {cpu_percent:.1f}%")
+        logger.info(f"- Memory Used: {memory_used:.1f} GB")
+        logger.info(f"- Memory Available: {memory_available:.1f} GB")
+        logger.info(f"- Memory Utilization: {memory.percent:.1f}%")
+
+        # Log failed downloads if any
+        if failed_downloads:
+            logger.warning("\nFailed downloads:")
+            for key in failed_downloads:
+                logger.warning(f"- {key}")
+
+        # Store final results
+        self.files_in_memory = results
+
+        # Clean up any partially downloaded data
+        if failed_downloads:
+            self.check_memory_usage()
+
+        return self.files_in_memory
+
+    def _process_batch(self, batch: List[str], batch_num: int, file_sizes: Dict[str, int]) -> Dict[str, bytes]:
+        """Process a single batch of files with performance monitoring and retries."""
+        batch_results = {}
+        failed_files = set()
+        batch_size_mb = sum(file_sizes[key] for key in batch) / (1024*1024)
+        start_time = time.time()
+        max_file_retries = 3
+
+        logger.info(f"Processing batch {batch_num}, size: {batch_size_mb:.2f} MB")
+
+        # Monitor memory before batch
+        mem_before = psutil.virtual_memory()
+
+        # Track files that need downloading (initially all files)
+        remaining_files = set(batch)
+        retry_count = 0
+
+        while remaining_files and retry_count < max_file_retries:
+            if retry_count > 0:
+                logger.info(f"Retry attempt {retry_count + 1} for {len(remaining_files)} files in batch {batch_num}")
+                time.sleep(2 ** retry_count)  # Exponential backoff
+
+            # Submit remaining files to thread pool
             future_to_key = {
                 self.thread_pool.submit(self.download_file_to_memory, key): key 
-                for key in batch
+                for key in remaining_files
             }
 
-            # Track progress with tqdm
-            with tqdm(total=len(batch), desc=f"Batch {i//batch_size + 1}") as pbar:
+            # Track batch progress with performance monitoring
+            successful_downloads = len(batch_results)
+            total_downloaded = sum(file_sizes[key] for key in batch_results)
+            retry_files = set()
+
+            with tqdm(total=len(remaining_files), 
+                     desc=f"Batch {batch_num}" + (f" (Retry {retry_count + 1})" if retry_count > 0 else "")) as pbar:
                 for future in as_completed(future_to_key):
                     key = future_to_key[future]
                     try:
                         file_key, content = future.result()
-                        results[file_key] = content
-                        pbar.update(1)
+                        batch_results[file_key] = content
+                        successful_downloads += 1
+                        total_downloaded += file_sizes[key]
+
+                        # Calculate and display current speed
+                        elapsed = time.time() - start_time
+                        if elapsed > 0:
+                            speed = total_downloaded / elapsed / (1024*1024)  # MB/s
+                            pbar.set_postfix({
+                                'Speed': f'{speed:.1f} MB/s',
+                                'Success': f'{successful_downloads}/{len(batch)}'
+                            })
+
                     except Exception as e:
-                        logger.error(f"Error downloading {key}: {str(e)}")
+                        logger.error(f"Error downloading {key} (attempt {retry_count + 1}): {str(e)}")
+                        retry_files.add(key)
+                    finally:
                         pbar.update(1)
 
-            # Force garbage collection after each batch
-            self.check_memory_usage()
+            # Update remaining files for next retry
+            remaining_files = retry_files
+            retry_count += 1
 
-        # Store results
-        self.files_in_memory = results
-        logger.info(f"Successfully downloaded {len(self.files_in_memory)} files to memory")
+        # Add any remaining failed files to the failed set
+        failed_files.update(remaining_files)
 
-        return self.files_in_memory
+        # Monitor memory and calculate statistics
+        mem_after = psutil.virtual_memory()
+        memory_used = (mem_after.used - mem_before.used) / (1024*1024)  # MB
+        elapsed_time = time.time() - start_time
+        avg_speed = batch_size_mb / elapsed_time if elapsed_time > 0 else 0
+
+        # Log batch completion status
+        success_rate = (len(batch) - len(failed_files)) / len(batch) * 100
+        logger.info(f"Batch {batch_num} completed:")
+        logger.info(f"- Speed: {avg_speed:.1f} MB/s")
+        logger.info(f"- Memory used: {memory_used:.1f} MB")
+        logger.info(f"- Success rate: {success_rate:.1f}% ({len(batch) - len(failed_files)}/{len(batch)})")
+
+        if failed_files:
+            logger.warning(f"Failed to download {len(failed_files)} files in batch {batch_num} after {max_file_retries} attempts")
+            # Clean up memory for failed files
+            for key in failed_files:
+                if key in batch_results:
+                    del batch_results[key]
+
+        # Check memory after batch
+        self.check_memory_usage()
+
+        return batch_results
 
 def get_performance_metrics():
     """Get current system performance metrics."""
