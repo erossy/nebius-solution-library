@@ -24,9 +24,15 @@ Arguments:
     --region        AWS region (default: None, uses default configuration)
     --access-key    AWS access key (default: None, uses default configuration)
     --secret-key    AWS secret key (default: None, uses default configuration)
+    --endpoint-url  Custom endpoint URL for S3-compatible storage (default: None)
 
-Example:
+Examples:
+    # Download from AWS S3
     python s3_fast_downloader.py --bucket my-bucket --prefix data/ --batch-size 10
+
+    # Download from MinIO or other S3-compatible storage
+    python s3_fast_downloader.py --bucket my-bucket --endpoint-url http://minio.example.com:9000 \
+        --access-key minioadmin --secret-key minioadmin --batch-size 10
 
 Performance Considerations:
 1. Memory Usage:
@@ -71,7 +77,7 @@ logger = logging.getLogger(__name__)
 class S3FastDownloader:
     def __init__(self, bucket_name: str, aws_access_key_id: str = None, 
                  aws_secret_access_key: str = None, region_name: str = None,
-                 max_retries: int = 3, num_processes: int = None,
+                 endpoint_url: str = None, max_retries: int = 3, num_processes: int = None,
                  multipart_threshold: int = 8 * 1024 * 1024,  # 8MB
                  max_concurrency: int = 10,
                  multipart_chunksize: int = 8 * 1024 * 1024):  # 8MB
@@ -114,6 +120,7 @@ class S3FastDownloader:
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             region_name=region_name,
+            endpoint_url=endpoint_url,
             config=config
         )
 
@@ -280,6 +287,7 @@ def main():
     parser.add_argument('--region', default=None, help='AWS region')
     parser.add_argument('--access-key', default=None, help='AWS access key')
     parser.add_argument('--secret-key', default=None, help='AWS secret key')
+    parser.add_argument('--endpoint-url', default=None, help='Custom endpoint URL for S3-compatible storage')
     args = parser.parse_args()
 
     try:
@@ -287,7 +295,8 @@ def main():
         s3_client = boto3.client('s3',
             aws_access_key_id=args.access_key,
             aws_secret_access_key=args.secret_key,
-            region_name=args.region
+            region_name=args.region,
+            endpoint_url=args.endpoint_url
         )
 
         # Get list of files
@@ -318,6 +327,7 @@ def main():
             aws_access_key_id=args.access_key,
             aws_secret_access_key=args.secret_key,
             region_name=args.region,
+            endpoint_url=args.endpoint_url,
             num_processes=cpu_count(),
             multipart_threshold=optimal_chunk_size,
             multipart_chunksize=optimal_chunk_size,
