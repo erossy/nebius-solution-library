@@ -119,6 +119,16 @@ class S3FastDownloader:
         logger.info(f"Configured with: {cpu_count()} CPUs, {max_concurrency} concurrent transfers")
         logger.info(f"Chunk size: {multipart_chunksize / (1024*1024):.1f}MB, Retries: {max_retries}")
 
+        # Initialize S3 client with optimized configuration
+        self.s3_client = boto3.client(
+            's3',
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            region_name=region_name,
+            endpoint_url=endpoint_url,
+            config=config
+        )
+
         # Verify endpoint accessibility
         try:
             self.s3_client.head_bucket(Bucket=bucket_name)
@@ -132,16 +142,6 @@ class S3FastDownloader:
             max_concurrency=max_concurrency,
             multipart_chunksize=multipart_chunksize,
             use_threads=True
-        )
-
-        # Initialize S3 client with optimized configuration
-        self.s3_client = boto3.client(
-            's3',
-            aws_access_key_id=aws_access_key_id,
-            aws_secret_access_key=aws_secret_access_key,
-            region_name=region_name,
-            endpoint_url=endpoint_url,
-            config=config
         )
 
         # Dictionary to store downloaded files in memory
