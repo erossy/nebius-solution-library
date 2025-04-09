@@ -733,9 +733,8 @@ if __name__ == "__main__":
     # Start download processes
     download_processes = []
     for i, process_chunks in enumerate(chunks_per_process):
-      if
-    not process_chunks:
-    continue
+      if not process_chunks:
+        continue
 
     p = Process(
       target=self._download_process,
