@@ -1217,7 +1217,7 @@ files_by_chunks = sorted(
 # Initialize process assignments
 chunks_per_process = [[] for _ in range(self.processes)]
 chunks_assigned_per_process = [0]
-for _ in range(self.processes)
+for _ in range(self.processes):
 
 # First, try to keep all chunks from the same file in the same process
 # if it doesn't create significant imbalance
