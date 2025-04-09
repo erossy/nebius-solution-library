@@ -55,10 +55,11 @@ def create_client(args):
 
 
 class MultiprocessingS3:
-  def __init__(self, s3_client, concurrency, multipart_size):
+  def __init__(self, args, concurrency, multipart_size):
     self.__pool = multiprocessing.Pool(concurrency)
-    self.s3_client = s3_client
+    self.args = args
     self.multipart_size = multipart_size
+    self.s3_client = create_client(args)
     time.sleep(0.5)  # Brief time for pool initialization
 
   def upload_object(self, bucket_name, object_key, data):
@@ -69,7 +70,7 @@ class MultiprocessingS3:
     i = 0
     j = 1
     while i < len(data):
-      datas.append((bucket_name, object_key, mu_id, j, data[i:i + self.multipart_size], self.s3_client))
+      datas.append((bucket_name, object_key, mu_id, j, data[i:i + self.multipart_size], self.args))
       i += self.multipart_size
       j += 1
 
@@ -90,7 +91,8 @@ class MultiprocessingS3:
 
   @staticmethod
   def _upload_part(arg):
-    bucket_name, object_key, mu_id, index, data, s3_client = arg
+    bucket_name, object_key, mu_id, index, data, args = arg
+    s3_client = create_client(args)
     part = s3_client.upload_part(
       Bucket=bucket_name,
       Key=object_key,
@@ -107,14 +109,15 @@ class MultiprocessingS3:
     part_range = []
     i = 0
     while i < data_len - 1:
-      part_range.append((bucket_name, object_key, i, min(i + self.multipart_size, data_len) - 1, self.s3_client))
+      part_range.append((bucket_name, object_key, i, min(i + self.multipart_size, data_len) - 1, self.args))
       i += self.multipart_size
 
     return self.__pool.map(self._download_range, part_range)
 
   @staticmethod
   def _download_range(arg):
-    bucket_name, object_key, range_start, range_end, s3_client = arg
+    bucket_name, object_key, range_start, range_end, args = arg
+    s3_client = create_client(args)
     result = s3_client.get_object(
       Bucket=bucket_name,
       Key=object_key,
@@ -124,9 +127,23 @@ class MultiprocessingS3:
     return data
 
 
-def process_file(args, file_index, timestamp, source_filename, s3_client, multipart_size):
+def process_file(args_dict, file_index, timestamp, source_filename):
+  # Convert dict back to args-like object for compatibility
+  class Args:
+    pass
+
+  args = Args()
+  for key, value in args_dict.items():
+    setattr(args, key, value)
+
+  # Create a new S3 client within this process
+  s3_client = create_client(args)
+
+  # Calculate multipart size
+  multipart_size = args.multipart_size_mb * boto3.s3.transfer.MB
+
   # Create a dedicated MultiprocessingS3 instance for this file
-  pool_client = MultiprocessingS3(s3_client, args.concurrency, multipart_size)
+  pool_client = MultiprocessingS3(args, args.concurrency, multipart_size)
 
   operation_start = time.time()
   retry_index = 0
@@ -186,7 +203,7 @@ def process_file(args, file_index, timestamp, source_filename, s3_client, multip
 def main():
   args = parse_args()
 
-  # Initialize S3 client
+  # Initialize S3 client for the main process
   s3_client = create_client(args)
 
   # Calculate multipart size
@@ -231,7 +248,7 @@ def main():
   source_filename = None
   if args.mode == "download" and not args.prefix:
     print("Preparing source file for download testing...")
-    upload_client = MultiprocessingS3(s3_client, args.concurrency, multipart_size)
+    upload_client = MultiprocessingS3(args, args.concurrency, multipart_size)
     source_filename = f"{filename_suffix}download_source_{timestamp}"
     # Generate random data for source file
     data = np.random.bytes(args.object_size_mb * boto3.s3.transfer.MB)
@@ -249,6 +266,9 @@ def main():
 
   throughputs = []
 
+  # Convert args to dictionary for pickling
+  args_dict = vars(args)
+
   # Use ProcessPoolExecutor to handle multiple files in parallel
   with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
     futures = []
@@ -259,12 +279,10 @@ def main():
       for i, file_key in enumerate(file_keys):
         future = executor.submit(
           process_file,
-          args,
+          args_dict,
           i,
           timestamp,
-          file_key,  # Use the actual file key instead of source_filename
-          s3_client,
-          multipart_size
+          file_key  # Use the actual file key instead of source_filename
         )
         futures.append(future)
     else:
@@ -272,12 +290,10 @@ def main():
       for i in range(args.iteration_number):
         future = executor.submit(
           process_file,
-          args,
+          args_dict,
           i,
           timestamp,
-          source_filename,
-          s3_client,
-          multipart_size
+          source_filename
         )
         futures.append(future)
 
@@ -288,6 +304,59 @@ def main():
         throughputs.append(throughput)
       except Exception as e:
         print(f"File processing failed: {e}")
+
+  end_time = datetime.now()
+
+  # Calculate statistics across all iterations
+  if throughputs:
+    agg_throughputs = np.array(throughputs)
+    percentiles = np.percentile(agg_throughputs, [0, 5, 50, 75, 95, 100])
+    agg_stats = {
+      "mean": float(f"{np.mean(agg_throughputs):.2f}"),
+      "min": float(f"{np.min(agg_throughputs):.2f}"),
+      "max": float(f"{np.max(agg_throughputs):.2f}"),
+      "std": float(f"{np.std(agg_throughputs):.2f}"),
+      "total_throughput": float(f"{np.sum(agg_throughputs):.2f}"),
+    }
+
+    # Add machine info for reference
+    machine_info = {
+      "cpu_count": os.cpu_count(),
+      "requested_file_parallelism": args.file_parallelism,
+      "actual_file_parallelism": max_workers,
+      "concurrency_per_file": args.concurrency,
+      "max_pool_connections": args.max_pool_connections,
+    }
+
+    summary = {
+      "mode": args.mode,
+      "object_size_mb": args.object_size_mb,
+      "num_iterations": args.iteration_number,
+      "throughput_percentile": {
+        "p0": float(f"{percentiles[0]:.2f}"),
+        "p5": float(f"{percentiles[1]:.2f}"),
+        "p50": float(f"{percentiles[2]:.2f}"),
+        "p75": float(f"{percentiles[3]:.2f}"),
+        "p95": float(f"{percentiles[4]:.2f}"),
+        "p100": float(f"{percentiles[5]:.2f}"),
+      },
+      "throughput_aggregates": agg_stats,
+      "machine_info": machine_info,
+      "timestamp": timestamp,
+      "start_time": start_time.isoformat(),
+      "end_time": end_time.isoformat(),
+      "total_duration_seconds": (end_time - start_time).total_seconds(),
+    }
+
+    print("\nJSON Summary:")
+    print(json.dumps(summary, indent=2))
+
+    # Print a simplified summary for quick reference
+    total_throughput = agg_stats["total_throughput"]
+    print(f"\nTotal Combined Throughput: {total_throughput:.2f} MiB/sec")
+    print(f"Total Duration: {(end_time - start_time).total_seconds():.2f} seconds")
+  else:
+    print("No successful downloads to report.")
 
   end_time = datetime.now()
 
