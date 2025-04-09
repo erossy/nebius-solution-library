@@ -128,32 +128,37 @@ class MultiprocessingS3:
 
 
 def process_file(args_dict, file_index, timestamp, source_filename):
-  # Convert dict back to args-like object for compatibility
-  class Args:
-    pass
-
-  args = Args()
-  for key, value in args_dict.items():
-    setattr(args, key, value)
+  # No need to convert dict back to object, just use the dict directly
 
   # Create a new S3 client within this process
-  s3_client = create_client(args)
+  s3_client = boto3.session.Session(
+    aws_access_key_id=args_dict['access_key_aws_id'],
+    aws_secret_access_key=args_dict['secret_access_key'],
+    region_name=args_dict['region_name'],
+  ).client(
+    "s3",
+    endpoint_url=args_dict['endpoint_url'],
+    config=botocore.config.Config(
+      max_pool_connections=args_dict['max_pool_connections'],
+      retries={'max_attempts': 10, 'mode': 'adaptive'}
+    )
+  )
 
   # Calculate multipart size
-  multipart_size = args.multipart_size_mb * boto3.s3.transfer.MB
+  multipart_size = args_dict['multipart_size_mb'] * boto3.s3.transfer.MB
 
-  # Create a dedicated MultiprocessingS3 instance for this file
-  pool_client = MultiprocessingS3(args, args.concurrency, multipart_size)
+  # Create a multiprocessing pool for this file's parts
+  pool = multiprocessing.Pool(args_dict['concurrency'])
 
   operation_start = time.time()
   retry_index = 0
 
   # For prefix mode, get the object size for throughput calculation
-  object_size_mb = args.object_size_mb
-  if args.mode == "download" and args.prefix:
+  object_size_mb = args_dict['object_size_mb']
+  if args_dict['mode'] == "download" and args_dict.get('prefix'):
     try:
       # Get the actual file size for existing files with prefix
-      head_res = s3_client.head_object(Bucket=args.bucket_name, Key=source_filename)
+      head_res = s3_client.head_object(Bucket=args_dict['bucket_name'], Key=source_filename)
       object_size_mb = int(head_res['ContentLength']) / (1024 * 1024)
       file_display_name = source_filename  # Use the original key name for display
     except Exception as e:
@@ -164,22 +169,110 @@ def process_file(args_dict, file_index, timestamp, source_filename):
 
   while True:
     try:
-      if args.mode == "upload":
+      if args_dict['mode'] == "upload":
         # Generate random data for upload mode
-        data = np.random.bytes(args.object_size_mb * boto3.s3.transfer.MB)
-        pool_client.upload_object(
-          bucket_name=args.bucket_name,
-          object_key=f"{args.filename_suffix or ''}my_upload_{file_index}_{timestamp}",
-          data=data
+        data = np.random.bytes(args_dict['object_size_mb'] * boto3.s3.transfer.MB)
+
+        # Create multipart upload
+        mu = s3_client.create_multipart_upload(
+          Bucket=args_dict['bucket_name'],
+          Key=f"{args_dict.get('filename_suffix', '') or ''}my_upload_{file_index}_{timestamp}"
         )
-      elif args.mode == "download":
-        pool_client.download_object(
-          bucket_name=args.bucket_name,
-          object_key=source_filename
+        mu_id = mu['UploadId']
+
+        # Prepare chunks for upload
+        chunks = []
+        i = 0
+        j = 1
+        while i < len(data):
+          chunk_data = data[i:i + multipart_size]
+          chunks.append((
+            args_dict['bucket_name'],
+            f"{args_dict.get('filename_suffix', '') or ''}my_upload_{file_index}_{timestamp}",
+            mu_id,
+            j,
+            chunk_data,
+            args_dict['endpoint_url'],
+            args_dict['access_key_aws_id'],
+            args_dict['secret_access_key'],
+            args_dict['region_name']
+          ))
+          i += multipart_size
+          j += 1
+
+        # Static method for the worker
+        def upload_part(arg):
+          bucket, key, upload_id, part_num, part_data, endpoint, access_key, secret_key, region = arg
+          s3 = boto3.session.Session(
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region
+          ).client("s3", endpoint_url=endpoint)
+
+          response = s3.upload_part(
+            Bucket=bucket,
+            Key=key,
+            PartNumber=part_num,
+            UploadId=upload_id,
+            Body=part_data
+          )
+          return part_num, response['ETag']
+
+        # Upload parts in parallel
+        parts = pool.map(upload_part, chunks)
+
+        # Complete multipart upload
+        s3_client.complete_multipart_upload(
+          Bucket=args_dict['bucket_name'],
+          Key=f"{args_dict.get('filename_suffix', '') or ''}my_upload_{file_index}_{timestamp}",
+          UploadId=mu_id,
+          MultipartUpload={'Parts': [{'PartNumber': p[0], 'ETag': p[1]} for p in parts]}
         )
+
+      elif args_dict['mode'] == "download":
+        # Get object size
+        head_res = s3_client.head_object(Bucket=args_dict['bucket_name'], Key=source_filename)
+        data_len = int(head_res['ContentLength'])
+
+        # Prepare ranges for parallel download
+        ranges = []
+        i = 0
+        while i < data_len - 1:
+          ranges.append((
+            args_dict['bucket_name'],
+            source_filename,
+            i,
+            min(i + multipart_size, data_len) - 1,
+            args_dict['endpoint_url'],
+            args_dict['access_key_aws_id'],
+            args_dict['secret_access_key'],
+            args_dict['region_name']
+          ))
+          i += multipart_size
+
+        # Static method for the worker
+        def download_range(arg):
+          bucket, key, start, end, endpoint, access_key, secret_key, region = arg
+          s3 = boto3.session.Session(
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region
+          ).client("s3", endpoint_url=endpoint)
+
+          response = s3.get_object(
+            Bucket=bucket,
+            Key=key,
+            Range=f"bytes={start}-{end}"
+          )
+          return response['Body'].read()
+
+        # Download parts in parallel
+        pool.map(download_range, ranges)
+
       else:
-        raise ValueError(f"incorrect mode: {args.mode}")
+        raise ValueError(f"incorrect mode: {args_dict['mode']}")
       break
+
     except Exception as e:
       retry_index = retry_index + 1
       if retry_index > 10:
@@ -188,6 +281,10 @@ def process_file(args_dict, file_index, timestamp, source_filename):
       print(f"Fail on {file_display_name}: {str(e)}, retrying")
       time.sleep(1)  # Add a short delay before retrying
       continue
+
+  # Clean up
+  pool.close()
+  pool.join()
 
   operation_end = time.time()
   duration = operation_end - operation_start
@@ -205,9 +302,6 @@ def main():
 
   # Initialize S3 client for the main process
   s3_client = create_client(args)
-
-  # Calculate multipart size
-  multipart_size = args.multipart_size_mb * boto3.s3.transfer.MB
 
   # Format filename suffix
   filename_suffix = args.filename_suffix or ""
@@ -248,15 +342,73 @@ def main():
   source_filename = None
   if args.mode == "download" and not args.prefix:
     print("Preparing source file for download testing...")
-    upload_client = MultiprocessingS3(args, args.concurrency, multipart_size)
-    source_filename = f"{filename_suffix}download_source_{timestamp}"
-    # Generate random data for source file
+    # Directly create a multipart upload
     data = np.random.bytes(args.object_size_mb * boto3.s3.transfer.MB)
-    upload_client.upload_object(
-      bucket_name=args.bucket_name,
-      object_key=source_filename,
-      data=data
+    source_filename = f"{filename_suffix}download_source_{timestamp}"
+
+    # Create a multipart upload
+    mu = s3_client.create_multipart_upload(Bucket=args.bucket_name, Key=source_filename)
+    mu_id = mu['UploadId']
+
+    # Calculate the multipart size
+    multipart_size = args.multipart_size_mb * boto3.s3.transfer.MB
+
+    # Create a pool for uploading parts
+    pool = multiprocessing.Pool(args.concurrency)
+
+    # Prepare the parts
+    parts_data = []
+    i = 0
+    j = 1
+    while i < len(data):
+      parts_data.append((
+        args.bucket_name,
+        source_filename,
+        mu_id,
+        j,
+        data[i:i + multipart_size],
+        args.endpoint_url,
+        args.access_key_aws_id,
+        args.secret_access_key,
+        args.region_name
+      ))
+      i += multipart_size
+      j += 1
+
+    # Define the upload part function
+    def upload_part(arg):
+      bucket, key, upload_id, part_num, part_data, endpoint, access_key, secret_key, region = arg
+      s3 = boto3.session.Session(
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region
+      ).client("s3", endpoint_url=endpoint)
+
+      response = s3.upload_part(
+        Bucket=bucket,
+        Key=key,
+        PartNumber=part_num,
+        UploadId=upload_id,
+        Body=part_data
+      )
+      return part_num, response['ETag']
+
+    # Upload the parts
+    parts = pool.map(upload_part, parts_data)
+
+    # Close and join the pool
+    pool.close()
+    pool.join()
+
+    # Complete the multipart upload
+    part_info = {'Parts': [{'PartNumber': p[0], 'ETag': p[1]} for p in parts]}
+    s3_client.complete_multipart_upload(
+      Bucket=args.bucket_name,
+      Key=source_filename,
+      UploadId=mu_id,
+      MultipartUpload=part_info
     )
+
     print(f"Source file uploaded as {source_filename}")
 
   # Set up process-based parallelism for file operations
@@ -411,9 +563,62 @@ def main():
   else:
     print("No successful downloads to report.")
 
+  end_time = datetime.now()
+
+  # Calculate statistics across all iterations
+  if throughputs:
+    agg_throughputs = np.array(throughputs)
+    percentiles = np.percentile(agg_throughputs, [0, 5, 50, 75, 95, 100])
+    agg_stats = {
+      "mean": float(f"{np.mean(agg_throughputs):.2f}"),
+      "min": float(f"{np.min(agg_throughputs):.2f}"),
+      "max": float(f"{np.max(agg_throughputs):.2f}"),
+      "std": float(f"{np.std(agg_throughputs):.2f}"),
+      "total_throughput": float(f"{np.sum(agg_throughputs):.2f}"),
+    }
+
+    # Add machine info for reference
+    machine_info = {
+      "cpu_count": os.cpu_count(),
+      "requested_file_parallelism": args.file_parallelism,
+      "actual_file_parallelism": max_workers,
+      "concurrency_per_file": args.concurrency,
+      "max_pool_connections": args.max_pool_connections,
+    }
+
+    summary = {
+      "mode": args.mode,
+      "object_size_mb": args.object_size_mb,
+      "num_iterations": args.iteration_number,
+      "throughput_percentile": {
+        "p0": float(f"{percentiles[0]:.2f}"),
+        "p5": float(f"{percentiles[1]:.2f}"),
+        "p50": float(f"{percentiles[2]:.2f}"),
+        "p75": float(f"{percentiles[3]:.2f}"),
+        "p95": float(f"{percentiles[4]:.2f}"),
+        "p100": float(f"{percentiles[5]:.2f}"),
+      },
+      "throughput_aggregates": agg_stats,
+      "machine_info": machine_info,
+      "timestamp": timestamp,
+      "start_time": start_time.isoformat(),
+      "end_time": end_time.isoformat(),
+      "total_duration_seconds": (end_time - start_time).total_seconds(),
+    }
+
+    print("\nJSON Summary:")
+    print(json.dumps(summary, indent=2))
+
+    # Print a simplified summary for quick reference
+    total_throughput = agg_stats["total_throughput"]
+    print(f"\nTotal Combined Throughput: {total_throughput:.2f} MiB/sec")
+    print(f"Total Duration: {(end_time - start_time).total_seconds():.2f} seconds")
+  else:
+    print("No successful downloads to report.")
+
 
 if __name__ == "__main__":
   # Set higher shared memory limit for better multiprocessing performance
-  # This helps with sharing memory between processes
-  multiprocessing.set_start_method('spawn')  # More stable on high-core count systems
+  # Set spawn method for better compatibility
+  multiprocessing.set_start_method('spawn', force=True)
   main()
