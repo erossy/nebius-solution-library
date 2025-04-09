@@ -46,9 +46,10 @@ Performance Considerations:
    - Configurable batch size for optimal performance
 
 3. Network:
-   - S3 Transfer Acceleration enabled
+   - S3 Transfer Acceleration (when using standard AWS S3)
    - Optimized chunk sizes for transfer
    - Connection pooling for better performance
+   - Support for custom S3-compatible endpoints
 
 Requirements:
     See requirements.txt for dependencies
@@ -97,14 +98,33 @@ class S3FastDownloader:
         self.num_processes = num_processes or cpu_count()
 
         # Configure boto3 for maximum performance
-        config = Config(
-            max_pool_connections=50,  # Increase connection pool size
-            retries={'max_attempts': max_retries},
-            tcp_keepalive=True,
-            read_timeout=300,  # 5 minutes
-            connect_timeout=300,  # 5 minutes
-            s3={'use_accelerate_endpoint': True}  # Enable S3 Transfer Acceleration
-        )
+        config_params = {
+            'max_pool_connections': 50,  # Increase connection pool size
+            'retries': {'max_attempts': max_retries},
+            'tcp_keepalive': True,
+            'read_timeout': 300,  # 5 minutes
+            'connect_timeout': 300,  # 5 minutes
+        }
+
+        # Enable S3 Transfer Acceleration only when using standard AWS S3 (no custom endpoint)
+        if not endpoint_url:
+            config_params['s3'] = {'use_accelerate_endpoint': True}
+            logger.info("Using S3 Transfer Acceleration for improved performance")
+        else:
+            logger.info(f"Using custom endpoint: {endpoint_url} (S3 Transfer Acceleration disabled)")
+
+        config = Config(**config_params)
+
+        # Log configuration details
+        logger.info(f"Configured with: {cpu_count()} CPUs, {max_concurrency} concurrent transfers")
+        logger.info(f"Chunk size: {multipart_chunksize / (1024*1024):.1f}MB, Retries: {max_retries}")
+
+        # Verify endpoint accessibility
+        try:
+            self.s3_client.head_bucket(Bucket=bucket_name)
+            logger.info("Successfully connected to S3 endpoint")
+        except Exception as e:
+            raise ConnectionError(f"Failed to connect to S3 endpoint: {str(e)}")
 
         # Configure transfer settings
         self.transfer_config = TransferConfig(
