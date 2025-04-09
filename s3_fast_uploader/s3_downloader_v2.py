@@ -287,8 +287,8 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
 
 def upload_test_file(bucket_name, object_key, object_size_mb, concurrency, multipart_size_mb,
                      endpoint_url, access_key, secret_key, region):
-  """Upload a test file for download benchmarking"""
-  print(f"Uploading test file {object_key} of size {object_size_mb}MB...")
+  """Upload a terraform file for download benchmarking"""
+  print(f"Uploading terraform file {object_key} of size {object_size_mb}MB...")
 
   # Create a client
   s3_client = create_boto3_client(

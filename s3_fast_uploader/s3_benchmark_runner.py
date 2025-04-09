@@ -40,7 +40,7 @@ def parse_args():
                       default="download")
   parser.add_argument("--cleanup-memory", help="Enable memory cleanup", action="store_true")
   parser.add_argument("--output-dir", help="Directory to store results", default="benchmark_results")
-  parser.add_argument("--quick-test", help="Run a quick test with fewer combinations", action="store_true")
+  parser.add_argument("--quick-terraform", help="Run a quick terraform with fewer combinations", action="store_true")
   parser.add_argument("--iteration-number", help="Number of files to process", type=int, default=150)
   parser.add_argument("--s3-benchmark-path", help="Path to the S3 benchmark script",
                       default="./s3_downloader_v2.py")
@@ -137,13 +137,13 @@ def run_benchmark(args, params, run_id):
 
 
 def select_parameter_combinations(args, quick_test=False):
-  """Generate parameter combinations to test"""
+  """Generate parameter combinations to terraform"""
   file_parallelism_values = parse_range(args.file_parallelism_range)
   concurrency_values = parse_range(args.concurrency_range)
   multipart_size_mb_values = parse_range(args.multipart_size_mb_range)
   max_pool_connections_values = parse_range(args.max_pool_connections_range)
 
-  # For quick test, take a subset of values
+  # For quick terraform, take a subset of values
   if quick_test:
     file_parallelism_values = file_parallelism_values[::2] or [file_parallelism_values[0]]
     concurrency_values = concurrency_values[::2] or [concurrency_values[0]]
@@ -158,7 +158,7 @@ def select_parameter_combinations(args, quick_test=False):
   for fp in file_parallelism_values:
     for cc in concurrency_values:
       for mp in multipart_size_mb_values:
-        # Only test reasonable max_pool_connections values
+        # Only terraform reasonable max_pool_connections values
         min_pool = max(fp * cc * 2, 128)  # At least 2x the concurrent operations
         suitable_pools = [p for p in max_pool_connections_values if p >= min_pool]
 
@@ -166,7 +166,7 @@ def select_parameter_combinations(args, quick_test=False):
           # If no suitable value exists, use the minimum calculated value
           pool_values = [min_pool]
         elif quick_test:
-          # For quick test, just use the smallest suitable value
+          # For quick terraform, just use the smallest suitable value
           pool_values = [suitable_pools[0]]
         else:
           # Use all suitable values
