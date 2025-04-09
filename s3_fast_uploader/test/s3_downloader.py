@@ -29,6 +29,7 @@ def parse_args():
   parser.add_argument("--multipart-size-mb", help="Multipart part Size in MB", type=int, required=True)
   parser.add_argument("--file-parallelism", help="Number of files to download in parallel", type=int, default=4)
   parser.add_argument("--max-pool-connections", help="Max boto3 connection pool size", type=int, default=100)
+  parser.add_argument("--prefix", help="Only download files with this prefix", type=str, default=None)
 
   args = parser.parse_args()
 
@@ -127,8 +128,22 @@ def process_file(args, file_index, timestamp, source_filename, s3_client, multip
   # Create a dedicated MultiprocessingS3 instance for this file
   pool_client = MultiprocessingS3(s3_client, args.concurrency, multipart_size)
 
-  upload_start = time.time()
+  operation_start = time.time()
   retry_index = 0
+
+  # For prefix mode, get the object size for throughput calculation
+  object_size_mb = args.object_size_mb
+  if args.mode == "download" and args.prefix:
+    try:
+      # Get the actual file size for existing files with prefix
+      head_res = s3_client.head_object(Bucket=args.bucket_name, Key=source_filename)
+      object_size_mb = int(head_res['ContentLength']) / (1024 * 1024)
+      file_display_name = source_filename  # Use the original key name for display
+    except Exception as e:
+      print(f"Warning: Failed to get size for {source_filename}: {e}")
+      file_display_name = f"file_{file_index}"
+  else:
+    file_display_name = f"file_{file_index}"
 
   while True:
     try:
@@ -151,17 +166,19 @@ def process_file(args, file_index, timestamp, source_filename, s3_client, multip
     except Exception as e:
       retry_index = retry_index + 1
       if retry_index > 10:
-        print(f"Fail on file {file_index}: {str(e)}, raising exception")
+        print(f"Fail on {file_display_name}: {str(e)}, raising exception")
         raise e
-      print(f"Fail on file {file_index}: {str(e)}, retrying")
+      print(f"Fail on {file_display_name}: {str(e)}, retrying")
       time.sleep(1)  # Add a short delay before retrying
       continue
 
-  upload_end = time.time()
-  duration = upload_end - upload_start
-  throughput_mb = args.object_size_mb / duration
+  operation_end = time.time()
+  duration = operation_end - operation_start
+  throughput_mb = object_size_mb / duration
 
-  print(colored(f"File {file_index}: duration={duration:.2f}s throughput={throughput_mb:.2f} MiB/sec", "green"))
+  print(colored(
+    f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
+    "green"))
 
   return throughput_mb
 
@@ -184,9 +201,35 @@ def main():
   timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
   start_time = datetime.now()
 
-  # For download benchmark, upload the file first and use it as the source
+  # For download mode with prefix, get files to download from bucket
+  file_keys = []
+  if args.mode == "download" and args.prefix:
+    print(f"Listing files with prefix '{args.prefix}' from bucket {args.bucket_name}...")
+    paginator = s3_client.get_paginator('list_objects_v2')
+    pages = paginator.paginate(Bucket=args.bucket_name, Prefix=args.prefix)
+
+    for page in pages:
+      if 'Contents' in page:
+        for obj in page['Contents']:
+          file_keys.append(obj['Key'])
+
+    if not file_keys:
+      print(f"No files found with prefix '{args.prefix}'")
+      return
+
+    print(f"Found {len(file_keys)} files with prefix '{args.prefix}'")
+    # Limit to iteration_number if specified
+    if args.iteration_number < len(file_keys):
+      print(f"Limiting to first {args.iteration_number} files as per iteration_number")
+      file_keys = file_keys[:args.iteration_number]
+    else:
+      # Adjust iteration_number to match number of files found
+      args.iteration_number = len(file_keys)
+      print(f"Adjusting iteration_number to {args.iteration_number} to match files found")
+
+  # For download benchmark without prefix, upload the file first and use it as the source
   source_filename = None
-  if args.mode == "download":
+  if args.mode == "download" and not args.prefix:
     print("Preparing source file for download testing...")
     upload_client = MultiprocessingS3(s3_client, args.concurrency, multipart_size)
     source_filename = f"{filename_suffix}download_source_{timestamp}"
@@ -211,17 +254,32 @@ def main():
     futures = []
 
     # Submit all file processing tasks
-    for i in range(args.iteration_number):
-      future = executor.submit(
-        process_file,
-        args,
-        i,
-        timestamp,
-        source_filename,
-        s3_client,
-        multipart_size
-      )
-      futures.append(future)
+    if args.mode == "download" and args.prefix:
+      # Submit tasks for downloading existing files with prefix
+      for i, file_key in enumerate(file_keys):
+        future = executor.submit(
+          process_file,
+          args,
+          i,
+          timestamp,
+          file_key,  # Use the actual file key instead of source_filename
+          s3_client,
+          multipart_size
+        )
+        futures.append(future)
+    else:
+      # Standard behavior for upload or download without prefix
+      for i in range(args.iteration_number):
+        future = executor.submit(
+          process_file,
+          args,
+          i,
+          timestamp,
+          source_filename,
+          s3_client,
+          multipart_size
+        )
+        futures.append(future)
 
     # Collect results as they complete
     for future in concurrent.futures.as_completed(futures):
