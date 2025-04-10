@@ -1,4 +1,60 @@
-import argparse
+def validate_downloaded_files(download_results, args):
+  """Validate all downloaded files after downloads are complete"""
+  print("\nValidating downloaded files...")
+
+  if not args.save_to_disk:
+    print("No files saved to disk, skipping validation.")
+    return download_results
+
+  validation_results = []
+  validation_failures = []
+
+  for result in download_results:
+    if not result['download_success']:
+      # Skip files that failed during download
+      validation_failures.append(result)
+      validation_results.append(result)
+      continue
+
+    file_path = result['output_path']
+    expected_size = result['content_length']
+
+    try:
+      # Get actual file size on disk
+      actual_size = os.path.getsize(file_path)
+
+      # Compare sizes
+      if actual_size == expected_size:
+        print(colored(f"✓ {result['file_display_name']}: Validation successful ({actual_size} bytes)", "green"))
+        result['validation_success'] = True
+      else:
+        error_msg = f"Size mismatch: expected {expected_size} bytes, got {actual_size} bytes"
+        print(colored(f"✗ {result['file_display_name']}: Validation failed - {error_msg}", "red"))
+        result['validation_success'] = False
+        result['validation_error'] = error_msg
+        validation_failures.append(result)
+    except Exception as e:
+      error_msg = f"Validation error: {str(e)}"
+      print(colored(f"✗ {result['file_display_name']}: {error_msg}", "red"))
+      result['validation_success'] = False
+      result['validation_error'] = error_msg
+      validation_failures.append(result)
+
+    validation_results.append(result)
+
+  # Print validation summary
+  total = len(validation_results)
+  failed = len(validation_failures)
+
+  if failed > 0:
+    print(colored(f"\nValidation completed with issues: {failed} out of {total} files failed validation", "yellow"))
+  else:
+    print(colored(f"\nValidation completed successfully: All {total} files passed validation", "green"))
+
+  return validation_resultsimport
+  argparse
+
+
 import json
 import multiprocessing
 import time
@@ -97,7 +153,7 @@ def download_part_worker(args):
 
 
 def process_single_file(args_dict, file_index, timestamp, file_key):
-  """Process a single file download"""
+  """Process a single file download and return information needed for validation"""
   # Extract parameters from the dictionary
   bucket_name = args_dict['bucket_name']
   concurrency = args_dict['concurrency']
@@ -189,21 +245,71 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
         # Concatenate all parts
         complete_file = b''.join([chunk for _, chunk in sorted_results])
 
-        # Validate the file size
-        if len(complete_file) != content_length:
-          raise ValueError(
-            f"Downloaded file size ({len(complete_file)}) does not match expected size ({content_length})")
-
-        # Save to disk
+        # Save to disk without immediate validation
         if output_path:
           try:
             with open(output_path, 'wb') as f:
               f.write(complete_file)
-            print(f"Saved {file_display_name} to {output_path}")
+            print(f"Downloaded {file_display_name} to {output_path}")
           except Exception as e:
             print(colored(f"Error saving file to disk: {e}", "red"))
+            # Return error info for validation phase
+            return {
+              'file_key': file_key,
+              'file_display_name': file_display_name,
+              'download_success': False,
+              'content_length': content_length,
+              'download_size': 0,
+              'output_path': output_path,
+              'error': str(e),
+              'throughput_mb': 0
+            }
 
-        print(f"Successfully downloaded and validated {file_display_name}, size: {len(complete_file)} bytes")
+        # If we get here, the download was successful
+        # Calculate throughput
+        operation_end = time.time()
+        duration = operation_end - operation_start
+        throughput_mb = object_size_mb / duration
+
+        print(colored(
+          f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
+          "green"
+        ))
+
+        # Return information needed for later validation
+        return {
+          'file_key': file_key,
+          'file_display_name': file_display_name,
+          'download_success': True,
+          'content_length': content_length,
+          'download_size': len(complete_file) if save_to_disk else sum(results),
+          'output_path': output_path,
+          'throughput_mb': throughput_mb
+        }
+      else:
+        # If not saving to disk, just calculate the size from the results
+        total_downloaded = sum(results)
+
+        # Calculate throughput
+        operation_end = time.time()
+        duration = operation_end - operation_start
+        throughput_mb = object_size_mb / duration
+
+        print(colored(
+          f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
+          "green"
+        ))
+
+        # Return information without validation
+        return {
+          'file_key': file_key,
+          'file_display_name': file_display_name,
+          'download_success': True,
+          'content_length': content_length,
+          'download_size': total_downloaded,
+          'output_path': None,
+          'throughput_mb': throughput_mb
+        }
 
       # If we get here, the operation was successful
       break
@@ -212,21 +318,18 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
       retry_count += 1
       if retry_count > max_retries:
         print(f"Failed to process {file_display_name} after {max_retries} retries: {e}")
-        raise
+        return {
+          'file_key': file_key,
+          'file_display_name': file_display_name,
+          'download_success': False,
+          'content_length': 0,
+          'download_size': 0,
+          'output_path': output_path if save_to_disk else None,
+          'error': str(e),
+          'throughput_mb': 0
+        }
       print(f"Error processing {file_display_name} (attempt {retry_count}/{max_retries}): {e}")
       time.sleep(1)  # Wait before retrying
-
-  # Calculate throughput
-  operation_end = time.time()
-  duration = operation_end - operation_start
-  throughput_mb = object_size_mb / duration
-
-  print(colored(
-    f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
-    "green"
-  ))
-
-  return throughput_mb
 
 
 def upload_test_file(bucket_name, object_key, object_size_mb, concurrency, multipart_size_mb,
@@ -442,12 +545,18 @@ def main():
       futures.append(future)
 
     # Collect results as they complete
+    download_results = []
     for future in concurrent.futures.as_completed(futures):
       try:
-        throughput = future.result()
-        throughputs.append(throughput)
+        result = future.result()
+        download_results.append(result)
+        if result['download_success']:
+          throughputs.append(result['throughput_mb'])
       except Exception as e:
         print(f"File processing failed: {e}")
+
+  # Validate all downloaded files after all downloads are complete
+  validation_results = validate_downloaded_files(download_results, args)
 
   end_time = datetime.now()
 
@@ -492,6 +601,11 @@ def main():
       "end_time": end_time.isoformat(),
       "total_duration_seconds": (end_time - start_time).total_seconds(),
       "save_to_disk": args.save_to_disk,
+      "validation_summary": {
+        "total_files": len(validation_results),
+        "successful_downloads": sum(1 for r in validation_results if r['download_success']),
+        "validation_failures": sum(1 for r in validation_results if r.get('validation_success') is False)
+      }
     }
 
     print("\nJSON Summary:")
