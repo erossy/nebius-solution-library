@@ -1,60 +1,4 @@
-def validate_downloaded_files(download_results, args):
-  """Validate all downloaded files after downloads are complete"""
-  print("\nValidating downloaded files...")
-
-  if not args.save_to_disk:
-    print("No files saved to disk, skipping validation.")
-    return download_results
-
-  validation_results = []
-  validation_failures = []
-
-  for result in download_results:
-    if not result['download_success']:
-      # Skip files that failed during download
-      validation_failures.append(result)
-      validation_results.append(result)
-      continue
-
-    file_path = result['output_path']
-    expected_size = result['content_length']
-
-    try:
-      # Get actual file size on disk
-      actual_size = os.path.getsize(file_path)
-
-      # Compare sizes
-      if actual_size == expected_size:
-        print(colored(f"✓ {result['file_display_name']}: Validation successful ({actual_size} bytes)", "green"))
-        result['validation_success'] = True
-      else:
-        error_msg = f"Size mismatch: expected {expected_size} bytes, got {actual_size} bytes"
-        print(colored(f"✗ {result['file_display_name']}: Validation failed - {error_msg}", "red"))
-        result['validation_success'] = False
-        result['validation_error'] = error_msg
-        validation_failures.append(result)
-    except Exception as e:
-      error_msg = f"Validation error: {str(e)}"
-      print(colored(f"✗ {result['file_display_name']}: {error_msg}", "red"))
-      result['validation_success'] = False
-      result['validation_error'] = error_msg
-      validation_failures.append(result)
-
-    validation_results.append(result)
-
-  # Print validation summary
-  total = len(validation_results)
-  failed = len(validation_failures)
-
-  if failed > 0:
-    print(colored(f"\nValidation completed with issues: {failed} out of {total} files failed validation", "yellow"))
-  else:
-    print(colored(f"\nValidation completed successfully: All {total} files passed validation", "green"))
-
-  return validation_resultsimport
-  argparse
-
-
+import argparse
 import json
 import multiprocessing
 import time
@@ -426,6 +370,62 @@ def upload_test_file(bucket_name, object_key, object_size_mb, concurrency, multi
 
   print(f"Test file uploaded as {object_key}")
   return object_key
+
+
+def validate_downloaded_files(download_results, args):
+  """Validate all downloaded files after downloads are complete"""
+  print("\nValidating downloaded files...")
+
+  if not args.save_to_disk:
+    print("No files saved to disk, skipping validation.")
+    return download_results
+
+  validation_results = []
+  validation_failures = []
+
+  for result in download_results:
+    if not result['download_success']:
+      # Skip files that failed during download
+      validation_failures.append(result)
+      validation_results.append(result)
+      continue
+
+    file_path = result['output_path']
+    expected_size = result['content_length']
+
+    try:
+      # Get actual file size on disk
+      actual_size = os.path.getsize(file_path)
+
+      # Compare sizes
+      if actual_size == expected_size:
+        print(colored(f"✓ {result['file_display_name']}: Validation successful ({actual_size} bytes)", "green"))
+        result['validation_success'] = True
+      else:
+        error_msg = f"Size mismatch: expected {expected_size} bytes, got {actual_size} bytes"
+        print(colored(f"✗ {result['file_display_name']}: Validation failed - {error_msg}", "red"))
+        result['validation_success'] = False
+        result['validation_error'] = error_msg
+        validation_failures.append(result)
+    except Exception as e:
+      error_msg = f"Validation error: {str(e)}"
+      print(colored(f"✗ {result['file_display_name']}: {error_msg}", "red"))
+      result['validation_success'] = False
+      result['validation_error'] = error_msg
+      validation_failures.append(result)
+
+    validation_results.append(result)
+
+  # Print validation summary
+  total = len(validation_results)
+  failed = len(validation_failures)
+
+  if failed > 0:
+    print(colored(f"\nValidation completed with issues: {failed} out of {total} files failed validation", "yellow"))
+  else:
+    print(colored(f"\nValidation completed successfully: All {total} files passed validation", "green"))
+
+  return validation_results
 
 
 def delete_previous_files(bucket_name, prefix, s3_client):
