@@ -36,7 +36,7 @@ def parse_args():
   parser.add_argument("--endpoint-url", help="Endpoint URL", required=True)
   parser.add_argument("--bucket-name", help="Bucket Name", required=True)
   parser.add_argument("--iteration-number", help="Iteration Number", type=int, required=True)
-  parser.add_argument("--object-size-mb", help="Object Size in MB", type=int, required=True)
+  parser.add_argument("--object-size-mb", help="Object Size in MB", type=int, required=False)
   parser.add_argument("--concurrency", help="Concurrency per file", type=int, required=True)
   parser.add_argument("--multipart-size-mb", help="Multipart part Size in MB", type=int, required=True)
   parser.add_argument("--file-parallelism", help="Number of files to download in parallel", type=int, default=4)
@@ -51,6 +51,10 @@ def parse_args():
                       default=False)
 
   args = parser.parse_args()
+
+  # Validate that object-size-mb is provided if prefix is not used
+  if not args.prefix and args.object_size_mb is None:
+    parser.error("--object-size-mb is required when --prefix is not specified")
 
   print(f"Arguments were parsed: {args}")
   return args
@@ -218,7 +222,7 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
   bucket_name = args_dict['bucket_name']
   concurrency = args_dict['concurrency']
   multipart_size_mb = args_dict['multipart_size_mb']
-  object_size_mb = args_dict['object_size_mb']
+  object_size_mb = args_dict.get('object_size_mb')
   endpoint_url = args_dict['endpoint_url']
   access_key = args_dict['access_key_aws_id']
   secret_key = args_dict['secret_access_key']
@@ -580,14 +584,17 @@ def auto_optimize_parameters(args):
             file_sizes_mb.append(file_size_mb)
           except Exception as e:
             print(f"Warning: Failed to get size for {obj['Key']}: {e}")
-            # Use provided object size as fallback
-            file_sizes_mb.append(args.object_size_mb)
+            # Use provided object size as fallback or a default if none provided
+            fallback_size = args.object_size_mb if args.object_size_mb is not None else 10
+            file_sizes_mb.append(fallback_size)
 
     num_files = len(file_keys)
     if num_files == 0:
       print("No files found with prefix. Using default iteration number.")
       num_files = args.iteration_number
-      file_sizes_mb = [args.object_size_mb] * num_files
+      # Use provided object size as fallback or a default if none provided
+      fallback_size = args.object_size_mb if args.object_size_mb is not None else 10
+      file_sizes_mb = [fallback_size] * num_files
   else:
     # For benchmark mode, use the specified parameters
     file_sizes_mb = [args.object_size_mb] * args.iteration_number
@@ -597,13 +604,14 @@ def auto_optimize_parameters(args):
     median_object_size_mb = sorted(file_sizes_mb)[len(file_sizes_mb) // 2]
     total_volume_mb = sum(file_sizes_mb)
   else:
-    median_object_size_mb = args.object_size_mb
-    total_volume_mb = args.object_size_mb * num_files
+    # Default median size if we couldn't determine file sizes
+    median_object_size_mb = args.object_size_mb if args.object_size_mb is not None else 10
+    total_volume_mb = median_object_size_mb * num_files
 
   print(
     f"Files to download: {num_files}, Total volume: {total_volume_mb:.2f} MB, Median size: {median_object_size_mb:.2f} MB")
 
-  # Apply the new auto-optimize logic
+  # Apply the new auto-optimize logic as requested
   # 1. file-parallelism = smallest of amount of files to download vs 0.75*cpu_cores
   optimal_file_parallelism = min(num_files, int(cpu_count * 0.75))
   optimal_file_parallelism = max(1, optimal_file_parallelism)  # Ensure at least 1
@@ -616,7 +624,6 @@ def auto_optimize_parameters(args):
   optimal_concurrency = max(1, optimal_concurrency)  # Ensure at least 1
 
   # 3. multipart-size-mb = median object size / concurrency
-  # Ensure we don't get too small parts
   if median_object_size_mb > 0 and optimal_concurrency > 0:
     optimal_multipart_size = median_object_size_mb / optimal_concurrency
     # Ensure minimum part size is at least 5MB (S3 minimum) and round to nearest MB
@@ -625,7 +632,7 @@ def auto_optimize_parameters(args):
     # Fallback if calculation fails
     optimal_multipart_size = args.multipart_size_mb
 
-  # Update the parameters if they're different from current values
+  # Update only the parameters specified in the requirements
   if args.file_parallelism != optimal_file_parallelism:
     print(f"Auto-optimizing: Changing file_parallelism from {args.file_parallelism} to {optimal_file_parallelism}")
     args.file_parallelism = optimal_file_parallelism
@@ -657,10 +664,11 @@ def main():
     # Basic optimization without psutil
     if args.auto_optimize:
       cpu_count = os.cpu_count()
-      args.file_parallelism = max(1, int(cpu_count * 0.75))
-      args.concurrency = max(2, (cpu_count * 4) // args.file_parallelism)
-      args.io_threads = max(2, cpu_count // args.file_parallelism)
-      args.max_pool_connections = args.file_parallelism * args.concurrency * 2
+      args.file_parallelism = max(1, min(args.iteration_number, int(cpu_count * 0.75)))
+      if args.file_parallelism > 0:
+        args.concurrency = max(1, min(16, math.ceil(args.iteration_number / args.file_parallelism)))
+      # We don't modify other parameters based on the requirements
+      print(f"Auto-optimizing: file_parallelism={args.file_parallelism}, concurrency={args.concurrency}")
     else:
       print("Auto-optimization disabled. Using provided parameters.")
 
