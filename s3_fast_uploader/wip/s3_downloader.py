@@ -68,7 +68,7 @@ def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_c
 
 def download_part_worker(args):
   """Worker function for downloading a part of a file"""
-  bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region = args
+  bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, save_to_disk = args
 
   # Create a fresh client for this worker
   s3_client = create_boto3_client(
@@ -87,21 +87,13 @@ def download_part_worker(args):
     )
     # Read data
     chunk = response['Body'].read()
-    return start_byte, chunk  # Always return position and data for reassembly
+    if save_to_disk:
+      return start_byte, chunk  # Return position and data for reassembly
+    else:
+      return len(chunk)  # Just return the size we processed
   except Exception as e:
     print(f"Error downloading part of {object_key} ({start_byte}-{end_byte}): {e}")
     raise
-
-
-def save_file_to_disk_worker(args):
-  """Worker function for saving a file to disk"""
-  file_data, output_path = args
-  try:
-    with open(output_path, 'wb') as f:
-      f.write(file_data)
-    return True, output_path
-  except Exception as e:
-    return False, f"Error saving {output_path}: {e}"
 
 
 def process_single_file(args_dict, file_index, timestamp, file_key):
@@ -149,11 +141,13 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
     file_display_name = f"file_{file_index}"
 
   # Prepare output path if saving to disk
-  output_path = None
+  save_to_disk = args_dict.get('save_to_disk')
   if save_to_disk:
     # Create a clean filename based on the file_key
     safe_filename = os.path.basename(file_key).replace('/', '_')
     output_path = os.path.join(save_to_disk, safe_filename)
+  else:
+    output_path = None
 
   # Main processing loop with retries
   while retry_count <= max_retries:
@@ -177,7 +171,8 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
           endpoint_url,
           access_key,
           secret_key,
-          region
+          region,
+          save_to_disk is not None  # Need to keep data if we're saving to disk
         ))
 
         position = end_position + 1
@@ -186,31 +181,82 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
       with multiprocessing.Pool(processes=concurrency) as pool:
         results = pool.map(download_part_worker, download_parts)
 
-      # Sort results by start position and concat data
-      sorted_results = sorted(results, key=lambda x: x[0])
-      complete_file = b''.join([chunk for _, chunk in sorted_results])
+      # If saving to disk, reassemble the file
+      if save_to_disk:
+        # Sort results by start position
+        sorted_results = sorted(results, key=lambda x: x[0])
 
-      # Calculate throughput
-      operation_end = time.time()
-      duration = operation_end - operation_start
-      throughput_mb = object_size_mb / duration
+        # Concatenate all parts
+        complete_file = b''.join([chunk for _, chunk in sorted_results])
 
-      print(colored(
-        f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
-        "green"
-      ))
+        # Save to disk without immediate validation
+        if output_path:
+          try:
+            with open(output_path, 'wb') as f:
+              f.write(complete_file)
+            print(f"Downloaded {file_display_name} to {output_path}")
+          except Exception as e:
+            print(colored(f"Error saving file to disk: {e}", "red"))
+            # Return error info for validation phase
+            return {
+              'file_key': file_key,
+              'file_display_name': file_display_name,
+              'download_success': False,
+              'content_length': content_length,
+              'download_size': 0,
+              'output_path': output_path,
+              'error': str(e),
+              'throughput_mb': 0
+            }
 
-      # Return information - we'll handle disk saving later in a separate phase
-      return {
-        'file_key': file_key,
-        'file_display_name': file_display_name,
-        'download_success': True,
-        'content_length': content_length,
-        'download_size': len(complete_file),
-        'output_path': output_path,
-        'throughput_mb': throughput_mb,
-        'file_data': complete_file  # Always keep the data in memory
-      }
+        # If we get here, the download was successful
+        # Calculate throughput
+        operation_end = time.time()
+        duration = operation_end - operation_start
+        throughput_mb = object_size_mb / duration
+
+        print(colored(
+          f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
+          "green"
+        ))
+
+        # Return information needed for later validation
+        return {
+          'file_key': file_key,
+          'file_display_name': file_display_name,
+          'download_success': True,
+          'content_length': content_length,
+          'download_size': len(complete_file) if save_to_disk else sum(results),
+          'output_path': output_path,
+          'throughput_mb': throughput_mb
+        }
+      else:
+        # If not saving to disk, just calculate the size from the results
+        total_downloaded = sum(results)
+
+        # Calculate throughput
+        operation_end = time.time()
+        duration = operation_end - operation_start
+        throughput_mb = object_size_mb / duration
+
+        print(colored(
+          f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
+          "green"
+        ))
+
+        # Return information without validation
+        return {
+          'file_key': file_key,
+          'file_display_name': file_display_name,
+          'download_success': True,
+          'content_length': content_length,
+          'download_size': total_downloaded,
+          'output_path': None,
+          'throughput_mb': throughput_mb
+        }
+
+      # If we get here, the operation was successful
+      break
 
     except Exception as e:
       retry_count += 1
@@ -222,10 +268,9 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
           'download_success': False,
           'content_length': 0,
           'download_size': 0,
-          'output_path': output_path,
+          'output_path': output_path if save_to_disk else None,
           'error': str(e),
-          'throughput_mb': 0,
-          'file_data': None
+          'throughput_mb': 0
         }
       print(f"Error processing {file_display_name} (attempt {retry_count}/{max_retries}): {e}")
       time.sleep(1)  # Wait before retrying
@@ -327,54 +372,6 @@ def upload_test_file(bucket_name, object_key, object_size_mb, concurrency, multi
   return object_key
 
 
-def save_files_to_disk(download_results, max_workers):
-  """Save all successfully downloaded files to disk in parallel"""
-  if not any(result.get('output_path') for result in download_results):
-    print("No files to save to disk.")
-    return download_results
-
-  print("\nSaving files to disk in parallel...")
-  save_tasks = []
-
-  # Prepare tasks for files that were successfully downloaded
-  for result in download_results:
-    if result['download_success'] and result.get('file_data') and result.get('output_path'):
-      save_tasks.append((result['file_data'], result['output_path']))
-
-  save_results = []
-
-  # Use ProcessPoolExecutor to save files in parallel
-  with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-    futures = [executor.submit(save_file_to_disk_worker, task) for task in save_tasks]
-
-    for future, result in zip(futures, download_results):
-      try:
-        save_success, message = future.result()
-        result['save_success'] = save_success
-        if not save_success:
-          result['save_error'] = message
-          print(colored(f"Error saving {result['file_display_name']}: {message}", "red"))
-        else:
-          print(colored(f"Saved {result['file_display_name']} to {result['output_path']}", "green"))
-      except Exception as e:
-        result['save_success'] = False
-        result['save_error'] = str(e)
-        print(colored(f"Error saving {result['file_display_name']}: {e}", "red"))
-
-      # Remove the file data from the result to free memory
-      if 'file_data' in result:
-        del result['file_data']
-
-      save_results.append(result)
-
-  # Print summary
-  total_files = len(save_tasks)
-  successful = sum(1 for r in save_results if r.get('save_success') == True)
-  print(f"\nSaved {successful} out of {total_files} files to disk")
-
-  return save_results
-
-
 def validate_downloaded_files(download_results, args):
   """Validate all downloaded files after downloads are complete"""
   print("\nValidating downloaded files...")
@@ -387,8 +384,8 @@ def validate_downloaded_files(download_results, args):
   validation_failures = []
 
   for result in download_results:
-    if not result.get('save_success', False):
-      # Skip files that failed during save
+    if not result['download_success']:
+      # Skip files that failed during download
       validation_failures.append(result)
       validation_results.append(result)
       continue
@@ -558,14 +555,8 @@ def main():
       except Exception as e:
         print(f"File processing failed: {e}")
 
-  # PHASE 2: Save all files to disk in parallel (if save_to_disk is enabled)
-  if args.save_to_disk:
-    download_results = save_files_to_disk(download_results, max_workers)
-
-    # Validate all downloaded files after all saves are complete
-    validation_results = validate_downloaded_files(download_results, args)
-  else:
-    validation_results = download_results
+  # Validate all downloaded files after all downloads are complete
+  validation_results = validate_downloaded_files(download_results, args)
 
   end_time = datetime.now()
 
@@ -613,10 +604,7 @@ def main():
       "validation_summary": {
         "total_files": len(validation_results),
         "successful_downloads": sum(1 for r in validation_results if r['download_success']),
-        "successful_saves": sum(
-          1 for r in validation_results if r.get('save_success', False)) if args.save_to_disk else 0,
-        "validation_failures": sum(
-          1 for r in validation_results if r.get('validation_success') is False) if args.save_to_disk else 0
+        "validation_failures": sum(1 for r in validation_results if r.get('validation_success') is False)
       }
     }
 
