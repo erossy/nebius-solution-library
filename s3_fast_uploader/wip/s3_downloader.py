@@ -1,3 +1,434 @@
+
+import argparse import json import multiprocessing import time import concurrent.futures from datetime import datetime import os import sys import threading import queue from collections import defaultdict import boto3 import boto3.s3.transfer import botocore.config import numpy as np from termcolo
+
+pasted
+
+
+Error processing tempfile__46 (attempt 2/ 10): __enter__
+Error
+processing
+tempfile__64(attempt
+2 / 10): __enter__
+Error
+processing
+tempfile__53(attempt
+2 / 10): __enter__
+Error
+processing
+tempfile__70(attempt
+2 / 10): __enter__
+Error
+processing
+tempfile__92(attempt
+2 / 10): __enter__
+Error
+processing
+tem
+
+pasted
+
+I
+run
+this
+code and get
+the
+below
+error
+only if I
+specify - -save - to - disk
+argument
+
+I
+see
+you
+'ve shared two files with me:
+
+A
+Python
+script(paste.txt)
+for downloading files from AWS S3 with various configuration options and performance monitoring
+An
+error
+log(paste - 2.
+txt) showing
+repeated
+__enter__
+errors
+when
+trying
+to
+process
+temporary
+files
+The
+errors
+occur
+specifically
+when
+you
+'re using the --save-to-disk parameter. Let me analyze what'
+s
+happening
+here.
+
+What
+'s Going Wrong
+The
+error
+log
+shows
+that
+the
+download
+process is repeatedly
+failing
+with an __enter__ error for temporary files.This type of error typically occurs when there's an issue with context management (using with statements) or when there's a problem with file handling.
+
+Looking
+at
+your
+code, I
+can
+see
+it
+'s encountering issues when trying to save downloaded files. The pattern of errors suggests there might be a problem with:
+
+Concurrent
+file
+access
+File
+handle
+management
+Context
+manager
+implementation
+for file operations
+  Root
+  Cause
+  Analysis
+After
+reviewing
+the
+code, I
+believe
+the
+issue is related
+to
+how
+file
+parts
+are
+being
+handled in the
+multiprocessing
+environment.Here
+'s what'
+s
+likely
+happening:
+
+The
+script
+creates
+a
+multiprocessing
+pool
+to
+download
+file
+parts in parallel
+When
+save_to_disk is enabled, it
+tries
+to
+add
+the
+parts
+to
+a
+shared
+manager
+dictionary
+The
+error
+happens in the
+download_part_worker
+function
+when
+trying
+to
+handle
+context
+management
+for the file parts
+The
+problem
+appears
+to
+be
+that
+when
+you
+add
+a
+part
+to
+the
+manager
+dictionary
+with add_part(object_key, part_number, start_byte,
+              chunk), the chunk data (which is binary) may not be properly managed across process boundaries.
+
+How
+to
+Fix
+It
+Here
+'s what I recommend:
+
+python
+
+Fixed
+S3
+Download
+Script
+Code
+The
+Problem
+Explained
+The
+issue in your
+script
+appears
+to
+be
+related
+to
+how
+multiprocessing is handling
+binary
+data in the
+shared
+dictionary.When
+you
+use - -save - to - disk, the
+script
+tries
+to:
+
+Download
+file
+parts in parallel
+Store
+binary
+chunks in a
+shared
+dictionary
+managed
+by
+multiprocessing.Manager()
+Later
+assemble
+these
+chunks
+into
+a
+complete
+file
+The
+__enter__
+errors
+suggest
+there
+'s an issue with the context management of these binary objects when passed between processes.
+
+The
+Solution
+I
+'ve created a fixed version that makes the following changes:
+
+Instead
+of
+storing
+binary
+data in the
+shared
+dictionary(which
+can
+cause
+problems
+with pickling / unpickling across processes), it writes each downloaded part to a temporary file
+The
+file
+writer
+process
+then
+reads
+these
+files and assembles
+them
+into
+the
+final
+output
+file
+After
+the
+file is assembled, the
+temporary
+files
+are
+cleaned
+up
+This
+approach
+avoids
+passing
+large
+binary
+objects
+between
+processes, which is likely
+what
+'s causing your __enter__ errors.
+
+Implementation
+Steps
+To
+implement
+the
+fix:
+
+Replace
+the
+download_part_worker and add_part
+functions
+with the versions in the artifact
+Replace
+the
+file_writer_process
+function
+with the version in the artifact
+Make
+sure
+the
+temporary
+part
+directories
+get
+properly
+cleaned
+up
+Other
+Considerations
+If
+you
+'re dealing with very large files, you might want to further optimize by:
+
+Adding
+more
+error
+handling
+around
+file
+operations
+Using
+a
+more
+efficient
+method
+for combining file parts (like shutil.copyfileobj())
+Implementing
+a
+better
+cleanup
+mechanism
+for temporary files that ensures they're removed even if the process crashes
+Let
+me
+know if you
+'d like me to explain any part of this solution in more detail, or if you need help with other aspects of your S3 download script.
+
+rewrite
+the
+original
+code
+with the suggested fixes
+
+I
+'ll rewrite the entire script with the suggested fixes incorporated. Let me create a complete version of the fixed code:
+
+Complete
+Fixed
+S3
+Download
+Script
+Code
+
+continue
+
+Complete
+Fixed
+S3
+Download
+Script
+Code
+
+Complete
+Fixed
+S3
+Download
+Script
+Code
+
+Complete
+Fixed
+S3
+Download
+Script
+Code
+The
+complete
+fixed
+script is now in the
+artifact
+above.I
+'ve made several key changes to fix the issues with the --save-to-disk functionality:
+
+Changed
+file
+part
+handling: Instead
+of
+storing
+binary
+data
+directly in shared
+memory, the
+script
+now
+writes
+each
+downloaded
+part
+to
+a
+temporary
+file and only
+stores
+the
+file
+path in the
+shared
+dictionary.This
+avoids
+the
+__enter__
+errors
+that
+were
+occ
+
 import argparse
 import json
 import multiprocessing
@@ -90,11 +521,11 @@ def register_file(file_key, total_parts, content_length):
     }
 
 
-def add_part(file_key, part_number, start_byte, data):
-  """Add a downloaded part to the tracking system"""
+def add_part(file_key, part_number, start_byte, part_file):
+  """Add a downloaded part reference to the tracking system"""
   with file_lock:
     if file_key in file_parts:
-      file_parts[file_key][part_number] = (start_byte, data)
+      file_parts[file_key][part_number] = (start_byte, part_file)
 
       # Update metadata
       if file_key in file_metadata:
@@ -174,12 +605,24 @@ def download_part_worker(args):
       Key=object_key,
       Range=f"bytes={start_byte}-{end_byte}"
     )
+
     # Read data
     chunk = response['Body'].read()
 
     # Add to download tracker if we're saving to disk
     if save_to_disk:
-      add_part(object_key, part_number, start_byte, chunk)
+      # Create directory for temp parts if it doesn't exist
+      safe_key = object_key.replace('/', '_')
+      part_dir = os.path.join(save_to_disk, f"{safe_key}_parts")
+      os.makedirs(part_dir, exist_ok=True)
+
+      # Write the part to a temporary file instead of storing in memory
+      part_file = os.path.join(part_dir, f"part_{part_number}")
+      with open(part_file, 'wb') as f:
+        f.write(chunk)
+
+      # Add reference to the part file instead of the actual binary data
+      add_part(object_key, part_number, start_byte, part_file)
 
     return len(chunk)  # Return the size we processed
   except Exception as e:
@@ -207,8 +650,15 @@ def file_writer_process(save_to_disk, check_interval=0.5):
           # Sort parts by start byte
           sorted_parts = sorted(parts.items(), key=lambda x: parts[x[0]][0])
 
-          # Concatenate all parts
-          complete_file = b''.join([data for _, (_, data) in sorted_parts])
+          # Open all part files and concatenate
+          complete_file = bytearray()
+          for _, (_, part_file) in sorted_parts:
+            try:
+              with open(part_file, 'rb') as f:
+                complete_file.extend(f.read())
+            except Exception as e:
+              print(f"Error reading part file {part_file}: {e}")
+              raise
 
           # Create a clean filename based on the file_key
           safe_filename = os.path.basename(file_key).replace('/', '_')
@@ -217,6 +667,20 @@ def file_writer_process(save_to_disk, check_interval=0.5):
           # Save to disk
           with open(output_path, 'wb') as f:
             f.write(complete_file)
+
+          # Clean up temp part files
+          safe_key = file_key.replace('/', '_')
+          part_dir = os.path.join(save_to_disk, f"{safe_key}_parts")
+          if os.path.exists(part_dir):
+            for _, (_, part_file) in sorted_parts:
+              try:
+                os.remove(part_file)
+              except Exception as e:
+                print(f"Warning: Failed to remove temp file {part_file}: {e}")
+            try:
+              os.rmdir(part_dir)
+            except Exception as e:
+              print(f"Warning: Failed to remove temp directory {part_dir}: {e}")
 
           # Get metadata for reporting
           metadata = remove_file(file_key)
@@ -762,6 +1226,19 @@ def main():
     # Stop the file writer process
     file_writer_process_obj.terminate()
     file_writer_process_obj.join(timeout=2)
+
+    # Clean up any remaining temporary directories
+    if args.save_to_disk:
+      for file_key in file_keys:
+        safe_key = file_key.replace('/', '_')
+        part_dir = os.path.join(args.save_to_disk, f"{safe_key}_parts")
+        if os.path.exists(part_dir):
+          try:
+            import shutil
+            shutil.rmtree(part_dir, ignore_errors=True)
+            print(f"Cleaned up temporary directory: {part_dir}")
+          except Exception as e:
+            print(f"Warning: Failed to clean up temporary directory {part_dir}: {e}")
 
   # Stop the progress reporter thread
   if progress_reporter_thread and progress_reporter_thread.is_alive():
