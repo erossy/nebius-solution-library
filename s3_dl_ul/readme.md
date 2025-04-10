@@ -168,7 +168,7 @@ Network utilization was measured using the `bmon` tool. To reproduce similar mea
 
 2. Monitor specific network interface:
    ```bash
-   bmon -p 'interface_name' -r 1 -b -o format:fmt='ts = $(time=$(time) rx=$(attr:rxrate:bytes) tx=$(attr:txrate:bytes)\n'
+   bmon -p 'interface_name' -r 1 -b
    ```
    Replace `interface_name` with your actual network interface (e.g., eth0, ens5, etc.)
 
