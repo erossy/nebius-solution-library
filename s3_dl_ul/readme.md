@@ -125,7 +125,7 @@ python s3_downloader.py \
 
 ### Optimized Parameters for H100 (128 vCPU)
 
-The following parameters achieved the best performance results on H100 instances with 128 vCPUs:
+The following parameters achieved the best performance results on H100 instances with 128 vCPUs in eu-north1 for downloading 172 x 2GB files from a bucket in the same region:
 
 ```bash
 python3 s3_downloader.py \
