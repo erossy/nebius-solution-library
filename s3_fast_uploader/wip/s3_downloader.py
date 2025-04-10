@@ -6,22 +6,12 @@ import concurrent.futures
 from datetime import datetime
 import os
 import sys
-import threading
-import queue
-from collections import defaultdict
 
 import boto3
 import boto3.s3.transfer
 import botocore.config
 import numpy as np
 from termcolor import colored
-
-# Global shared resources - initialized in main process
-manager = None
-file_parts = None
-complete_files = None
-file_metadata = None
-file_lock = None
 
 
 def parse_args():
@@ -40,8 +30,6 @@ def parse_args():
   parser.add_argument("--max-pool-connections", help="Max boto3 connection pool size", type=int, default=100)
   parser.add_argument("--prefix", help="Only download files with this prefix", type=str, default=None)
   parser.add_argument("--save-to-disk", help="Path where to save downloaded files", type=str, default=None)
-  parser.add_argument("--save-interval", help="Interval in seconds to check for completed files", type=float,
-                      default=0.5)
 
   args = parser.parse_args()
 
@@ -78,86 +66,9 @@ def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_c
   return session.client("s3", endpoint_url=endpoint_url, config=botocore_config)
 
 
-def register_file(file_key, total_parts, content_length):
-  """Register a new file in the tracking system"""
-  with file_lock:
-    file_parts[file_key] = manager.dict()
-    file_metadata[file_key] = {
-      'total_parts': total_parts,
-      'content_length': content_length,
-      'download_start': time.time(),
-      'parts_completed': 0
-    }
-
-
-def add_part(file_key, part_number, start_byte, part_file):
-  """Add a downloaded part reference to the tracking system"""
-  with file_lock:
-    if file_key in file_parts:
-      file_parts[file_key][part_number] = (start_byte, part_file)
-
-      # Update metadata
-      if file_key in file_metadata:
-        file_metadata[file_key]['parts_completed'] += 1
-
-        # Check if file is complete
-        if file_metadata[file_key]['parts_completed'] >= file_metadata[file_key]['total_parts']:
-          complete_files[file_key] = True
-
-      return True
-    return False
-
-
-def get_complete_files():
-  """Get a list of files that are complete and ready to be written"""
-  with file_lock:
-    return list(complete_files.keys())
-
-
-def get_file_parts(file_key):
-  """Get all parts for a specific file"""
-  if file_key in file_parts:
-    return dict(file_parts[file_key])
-  return {}
-
-
-def remove_file(file_key):
-  """Remove a file from tracking after it's been written to disk"""
-  with file_lock:
-    metadata = None
-    if file_key in file_metadata:
-      metadata = dict(file_metadata[file_key])
-      del file_metadata[file_key]
-
-    if file_key in file_parts:
-      del file_parts[file_key]
-
-    if file_key in complete_files:
-      del complete_files[file_key]
-
-    return metadata
-
-
-def get_progress():
-  """Get current download progress information"""
-  with file_lock:
-    progress = {}
-    for file_key in file_metadata:
-      if file_key in file_metadata:
-        metadata = dict(file_metadata[file_key])
-        progress[file_key] = {
-          'total_parts': metadata['total_parts'],
-          'parts_completed': metadata['parts_completed'],
-          'percentage': (metadata['parts_completed'] / metadata['total_parts']) * 100 if metadata[
-                                                                                           'total_parts'] > 0 else 0,
-          'complete': file_key in complete_files
-        }
-    return progress
-
-
 def download_part_worker(args):
   """Worker function for downloading a part of a file"""
-  bucket_name, object_key, start_byte, end_byte, part_number, save_to_disk, endpoint_url, access_key, secret_key, region = args
+  bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region = args
 
   # Create a fresh client for this worker
   s3_client = create_boto3_client(
@@ -174,109 +85,23 @@ def download_part_worker(args):
       Key=object_key,
       Range=f"bytes={start_byte}-{end_byte}"
     )
-
     # Read data
     chunk = response['Body'].read()
-
-    # Add to download tracker if we're saving to disk
-    if save_to_disk:
-      # Create directory for temp parts if it doesn't exist
-      safe_key = object_key.replace('/', '_')
-      part_dir = os.path.join(save_to_disk, f"{safe_key}_parts")
-      os.makedirs(part_dir, exist_ok=True)
-
-      # Write the part to a temporary file instead of storing in memory
-      part_file = os.path.join(part_dir, f"part_{part_number}")
-      with open(part_file, 'wb') as f:
-        f.write(chunk)
-
-      # Add reference to the part file instead of the actual binary data
-      add_part(object_key, part_number, start_byte, part_file)
-
-    return len(chunk)  # Return the size we processed
+    return start_byte, chunk  # Always return position and data for reassembly
   except Exception as e:
-    print(f"Error downloading part {part_number} of {object_key} ({start_byte}-{end_byte}): {e}")
+    print(f"Error downloading part of {object_key} ({start_byte}-{end_byte}): {e}")
     raise
 
 
-def file_writer_process(save_to_disk, check_interval=0.5):
-  """Process that checks for completed files and writes them to disk"""
-  print(f"Starting file writer process with check interval of {check_interval} seconds")
-
-  while True:
-    try:
-      # Check for completed files
-      complete_file_keys = get_complete_files()
-
-      for file_key in complete_file_keys:
-        try:
-          # Get all parts for this file
-          parts = get_file_parts(file_key)
-
-          if not parts:
-            continue
-
-          # Sort parts by start byte
-          sorted_parts = sorted(parts.items(), key=lambda x: parts[x[0]][0])
-
-          # Open all part files and concatenate
-          complete_file = bytearray()
-          for _, (_, part_file) in sorted_parts:
-            try:
-              with open(part_file, 'rb') as f:
-                complete_file.extend(f.read())
-            except Exception as e:
-              print(f"Error reading part file {part_file}: {e}")
-              raise
-
-          # Create a clean filename based on the file_key
-          safe_filename = os.path.basename(file_key).replace('/', '_')
-          output_path = os.path.join(save_to_disk, safe_filename)
-
-          # Save to disk
-          with open(output_path, 'wb') as f:
-            f.write(complete_file)
-
-          # Clean up temp part files
-          safe_key = file_key.replace('/', '_')
-          part_dir = os.path.join(save_to_disk, f"{safe_key}_parts")
-          if os.path.exists(part_dir):
-            for _, (_, part_file) in sorted_parts:
-              try:
-                os.remove(part_file)
-              except Exception as e:
-                print(f"Warning: Failed to remove temp file {part_file}: {e}")
-            try:
-              os.rmdir(part_dir)
-            except Exception as e:
-              print(f"Warning: Failed to remove temp directory {part_dir}: {e}")
-
-          # Get metadata for reporting
-          metadata = remove_file(file_key)
-          if metadata:
-            download_duration = time.time() - metadata['download_start']
-            content_length = metadata['content_length']
-            object_size_mb = content_length / (1024 * 1024)
-            throughput_mb = object_size_mb / download_duration if download_duration > 0 else 0
-
-            print(colored(
-              f"Wrote {file_key} to {output_path}: size={object_size_mb:.2f}MB, duration={download_duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
-              "green"
-            ))
-          else:
-            print(f"Wrote {file_key} to {output_path}")
-
-        except Exception as e:
-          print(colored(f"Error writing file {file_key} to disk: {e}", "red"))
-          # Remove from tracking to avoid retrying
-          remove_file(file_key)
-
-      # No need to run continuously at full CPU
-      time.sleep(check_interval)
-
-    except Exception as e:
-      print(f"Error in file writer process: {e}")
-      time.sleep(check_interval)
+def save_file_to_disk_worker(args):
+  """Worker function for saving a file to disk"""
+  file_data, output_path = args
+  try:
+    with open(output_path, 'wb') as f:
+      f.write(file_data)
+    return True, output_path
+  except Exception as e:
+    return False, f"Error saving {output_path}: {e}"
 
 
 def process_single_file(args_dict, file_index, timestamp, file_key):
@@ -292,7 +117,7 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
   region = args_dict['region_name']
   max_pool_connections = args_dict['max_pool_connections']
   prefix = args_dict.get('prefix')
-  save_to_disk = args_dict.get('save_to_disk', None) is not None
+  save_to_disk = args_dict.get('save_to_disk', None)
 
   # Create a client for the main operations
   s3_client = create_boto3_client(
@@ -324,12 +149,11 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
     file_display_name = f"file_{file_index}"
 
   # Prepare output path if saving to disk
+  output_path = None
   if save_to_disk:
     # Create a clean filename based on the file_key
     safe_filename = os.path.basename(file_key).replace('/', '_')
-    output_path = os.path.join(args_dict.get('save_to_disk'), safe_filename)
-  else:
-    output_path = None
+    output_path = os.path.join(save_to_disk, safe_filename)
 
   # Main processing loop with retries
   while retry_count <= max_retries:
@@ -341,7 +165,6 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
       # Calculate parts for download
       download_parts = []
       position = 0
-      part_number = 1
 
       while position < content_length:
         end_position = min(position + multipart_size - 1, content_length - 1)
@@ -351,8 +174,6 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
           file_key,
           position,
           end_position,
-          part_number,
-          save_to_disk,
           endpoint_url,
           access_key,
           secret_key,
@@ -360,18 +181,14 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
         ))
 
         position = end_position + 1
-        part_number += 1
-
-      # Register the file with the download tracker if we're saving to disk
-      if save_to_disk:
-        register_file(file_key, len(download_parts), content_length)
 
       # Download parts in parallel
       with multiprocessing.Pool(processes=concurrency) as pool:
         results = pool.map(download_part_worker, download_parts)
 
-      # Calculate total downloaded
-      total_downloaded = sum(results)
+      # Sort results by start position and concat data
+      sorted_results = sorted(results, key=lambda x: x[0])
+      complete_file = b''.join([chunk for _, chunk in sorted_results])
 
       # Calculate throughput
       operation_end = time.time()
@@ -383,19 +200,17 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
         "green"
       ))
 
-      # Return information without validation
+      # Return information - we'll handle disk saving later in a separate phase
       return {
         'file_key': file_key,
         'file_display_name': file_display_name,
         'download_success': True,
         'content_length': content_length,
-        'download_size': total_downloaded,
-        'output_path': output_path if save_to_disk else None,
-        'throughput_mb': throughput_mb
+        'download_size': len(complete_file),
+        'output_path': output_path,
+        'throughput_mb': throughput_mb,
+        'file_data': complete_file  # Always keep the data in memory
       }
-
-      # If we get here, the operation was successful
-      break
 
     except Exception as e:
       retry_count += 1
@@ -407,9 +222,10 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
           'download_success': False,
           'content_length': 0,
           'download_size': 0,
-          'output_path': output_path if save_to_disk else None,
+          'output_path': output_path,
           'error': str(e),
-          'throughput_mb': 0
+          'throughput_mb': 0,
+          'file_data': None
         }
       print(f"Error processing {file_display_name} (attempt {retry_count}/{max_retries}): {e}")
       time.sleep(1)  # Wait before retrying
@@ -511,72 +327,97 @@ def upload_test_file(bucket_name, object_key, object_size_mb, concurrency, multi
   return object_key
 
 
-def validate_downloaded_files(bucket_name, validation_files, s3_client, save_to_disk):
+def save_files_to_disk(download_results, max_workers):
+  """Save all successfully downloaded files to disk in parallel"""
+  if not any(result.get('output_path') for result in download_results):
+    print("No files to save to disk.")
+    return download_results
+
+  print("\nSaving files to disk in parallel...")
+  save_tasks = []
+
+  # Prepare tasks for files that were successfully downloaded
+  for result in download_results:
+    if result['download_success'] and result.get('file_data') and result.get('output_path'):
+      save_tasks.append((result['file_data'], result['output_path']))
+
+  save_results = []
+
+  # Use ProcessPoolExecutor to save files in parallel
+  with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+    futures = [executor.submit(save_file_to_disk_worker, task) for task in save_tasks]
+
+    for future, result in zip(futures, download_results):
+      try:
+        save_success, message = future.result()
+        result['save_success'] = save_success
+        if not save_success:
+          result['save_error'] = message
+          print(colored(f"Error saving {result['file_display_name']}: {message}", "red"))
+        else:
+          print(colored(f"Saved {result['file_display_name']} to {result['output_path']}", "green"))
+      except Exception as e:
+        result['save_success'] = False
+        result['save_error'] = str(e)
+        print(colored(f"Error saving {result['file_display_name']}: {e}", "red"))
+
+      # Remove the file data from the result to free memory
+      if 'file_data' in result:
+        del result['file_data']
+
+      save_results.append(result)
+
+  # Print summary
+  total_files = len(save_tasks)
+  successful = sum(1 for r in save_results if r.get('save_success') == True)
+  print(f"\nSaved {successful} out of {total_files} files to disk")
+
+  return save_results
+
+
+def validate_downloaded_files(download_results, args):
   """Validate all downloaded files after downloads are complete"""
   print("\nValidating downloaded files...")
 
-  if not save_to_disk:
+  if not args.save_to_disk:
     print("No files saved to disk, skipping validation.")
-    return []
+    return download_results
 
   validation_results = []
   validation_failures = []
 
-  for file_key in validation_files:
-    try:
-      # Create safe filename
-      safe_filename = os.path.basename(file_key).replace('/', '_')
-      file_path = os.path.join(save_to_disk, safe_filename)
-
-      # Get metadata from S3
-      head_res = s3_client.head_object(Bucket=bucket_name, Key=file_key)
-      expected_size = head_res['ContentLength']
-
-      # Get actual file size on disk
-      if os.path.exists(file_path):
-        actual_size = os.path.getsize(file_path)
-
-        # Compare sizes
-        if actual_size == expected_size:
-          print(colored(f"✓ {file_key}: Validation successful ({actual_size} bytes)", "green"))
-          result = {
-            'file_key': file_key,
-            'validation_success': True,
-            'expected_size': expected_size,
-            'actual_size': actual_size
-          }
-        else:
-          error_msg = f"Size mismatch: expected {expected_size} bytes, got {actual_size} bytes"
-          print(colored(f"✗ {file_key}: Validation failed - {error_msg}", "red"))
-          result = {
-            'file_key': file_key,
-            'validation_success': False,
-            'validation_error': error_msg,
-            'expected_size': expected_size,
-            'actual_size': actual_size
-          }
-          validation_failures.append(result)
-      else:
-        error_msg = f"File not found: {file_path}"
-        print(colored(f"✗ {file_key}: Validation failed - {error_msg}", "red"))
-        result = {
-          'file_key': file_key,
-          'validation_success': False,
-          'validation_error': error_msg
-        }
-        validation_failures.append(result)
-
-      validation_results.append(result)
-    except Exception as e:
-      error_msg = f"Validation error: {str(e)}"
-      print(colored(f"✗ {file_key}: {error_msg}", "red"))
-      result = {
-        'file_key': file_key,
-        'validation_success': False,
-        'validation_error': error_msg
-      }
+  for result in download_results:
+    if not result.get('save_success', False):
+      # Skip files that failed during save
       validation_failures.append(result)
       validation_results.append(result)
+      continue
+
+    file_path = result['output_path']
+    expected_size = result['content_length']
+
+    try:
+      # Get actual file size on disk
+      actual_size = os.path.getsize(file_path)
+
+      # Compare sizes
+      if actual_size == expected_size:
+        print(colored(f"✓ {result['file_display_name']}: Validation successful ({actual_size} bytes)", "green"))
+        result['validation_success'] = True
+      else:
+        error_msg = f"Size mismatch: expected {expected_size} bytes, got {actual_size} bytes"
+        print(colored(f"✗ {result['file_display_name']}: Validation failed - {error_msg}", "red"))
+        result['validation_success'] = False
+        result['validation_error'] = error_msg
+        validation_failures.append(result)
+    except Exception as e:
+      error_msg = f"Validation error: {str(e)}"
+      print(colored(f"✗ {result['file_display_name']}: {error_msg}", "red"))
+      result['validation_success'] = False
+      result['validation_error'] = error_msg
+      validation_failures.append(result)
+
+    validation_results.append(result)
 
   # Print validation summary
   total = len(validation_results)
@@ -612,37 +453,6 @@ def delete_previous_files(bucket_name, prefix, s3_client):
           print(f"Error deleting {key}: {e}")
 
   print(f"Deleted {delete_count} files with prefix '{prefix}'")
-
-
-def progress_reporter(interval=2.0):
-  """Report overall download progress periodically"""
-  while True:
-    try:
-      progress = get_progress()
-      if progress:
-        # Print a simple progress overview
-        complete_files_count = sum(1 for f in progress.values() if f['complete'])
-        total_files = len(progress)
-        total_parts = sum(f['total_parts'] for f in progress.values())
-        completed_parts = sum(f['parts_completed'] for f in progress.values())
-
-        if total_parts > 0:
-          overall_percentage = (completed_parts / total_parts) * 100
-        else:
-          overall_percentage = 0
-
-        # Clear line and print progress
-        sys.stdout.write("\r" + " " * 80 + "\r")  # Clear line
-        sys.stdout.write(
-          f"Progress: {complete_files_count}/{total_files} files complete | " +
-          f"{completed_parts}/{total_parts} parts ({overall_percentage:.1f}%)"
-        )
-        sys.stdout.flush()
-
-      time.sleep(interval)
-    except Exception as e:
-      print(f"\nError in progress reporter: {e}")
-      time.sleep(interval)
 
 
 def main():
@@ -717,37 +527,6 @@ def main():
   max_workers = min(args.file_parallelism, args.iteration_number)
   print(f"Using {max_workers} parallel workers for file operations")
 
-  # Initialize the shared resources for download tracking
-  global manager, file_parts, complete_files, file_metadata, file_lock
-
-  # Initialize shared resources if saving to disk
-  file_writer_process_obj = None
-  progress_reporter_thread = None
-
-  if args.save_to_disk:
-    # Initialize shared resources
-    manager = multiprocessing.Manager()
-    file_parts = manager.dict()
-    complete_files = manager.dict()
-    file_metadata = manager.dict()
-    file_lock = manager.Lock()
-
-    # Start the file writer process
-    file_writer_process_obj = multiprocessing.Process(
-      target=file_writer_process,
-      args=(args.save_to_disk, args.save_interval)
-    )
-    file_writer_process_obj.daemon = True
-    file_writer_process_obj.start()
-
-    # Start the progress reporter thread
-    progress_reporter_thread = threading.Thread(
-      target=progress_reporter,
-      args=(2.0,)  # Report every 2 seconds
-    )
-    progress_reporter_thread.daemon = True
-    progress_reporter_thread.start()
-
   throughputs = []
 
   # Convert args to dictionary for pickling
@@ -779,40 +558,14 @@ def main():
       except Exception as e:
         print(f"File processing failed: {e}")
 
-  # Wait for the file writer to finish processing any remaining files
-  if file_writer_process_obj:
-    print("\nWaiting for file writer to finish processing remaining files...")
-    time.sleep(5)  # Give some time for the last files to be processed
+  # PHASE 2: Save all files to disk in parallel (if save_to_disk is enabled)
+  if args.save_to_disk:
+    download_results = save_files_to_disk(download_results, max_workers)
 
-    # Validate all downloaded files
-    validation_results = validate_downloaded_files(
-      args.bucket_name,
-      [result['file_key'] for result in download_results if result['download_success']],
-      s3_client,
-      args.save_to_disk
-    )
-
-    # Stop the file writer process
-    file_writer_process_obj.terminate()
-    file_writer_process_obj.join(timeout=2)
-
-    # Clean up any remaining temporary directories
-    if args.save_to_disk:
-      for file_key in file_keys:
-        safe_key = file_key.replace('/', '_')
-        part_dir = os.path.join(args.save_to_disk, f"{safe_key}_parts")
-        if os.path.exists(part_dir):
-          try:
-            import shutil
-            shutil.rmtree(part_dir, ignore_errors=True)
-            print(f"Cleaned up temporary directory: {part_dir}")
-          except Exception as e:
-            print(f"Warning: Failed to clean up temporary directory {part_dir}: {e}")
-
-  # Stop the progress reporter thread
-  if progress_reporter_thread and progress_reporter_thread.is_alive():
-    # No need to explicitly stop - daemon threads will exit when main thread exits
-    print("\n")  # Just add a newline after the progress output
+    # Validate all downloaded files after all saves are complete
+    validation_results = validate_downloaded_files(download_results, args)
+  else:
+    validation_results = download_results
 
   end_time = datetime.now()
 
@@ -835,8 +588,7 @@ def main():
       "actual_file_parallelism": max_workers,
       "concurrency_per_file": args.concurrency,
       "max_pool_connections": args.max_pool_connections,
-      "save_to_disk": args.save_to_disk is not None,
-      "save_interval": args.save_interval if args.save_to_disk else None,
+      "save_to_disk": args.save_to_disk,
     }
 
     summary = {
@@ -859,8 +611,12 @@ def main():
       "total_duration_seconds": (end_time - start_time).total_seconds(),
       "save_to_disk": args.save_to_disk,
       "validation_summary": {
-        "total_files": len(download_results),
-        "successful_downloads": sum(1 for r in download_results if r['download_success']),
+        "total_files": len(validation_results),
+        "successful_downloads": sum(1 for r in validation_results if r['download_success']),
+        "successful_saves": sum(
+          1 for r in validation_results if r.get('save_success', False)) if args.save_to_disk else 0,
+        "validation_failures": sum(
+          1 for r in validation_results if r.get('validation_success') is False) if args.save_to_disk else 0
       }
     }
 
