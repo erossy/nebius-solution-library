@@ -31,7 +31,7 @@ def parse_args():
   parser.add_argument("--prefix", help="Only download files with this prefix", type=str, default=None)
   parser.add_argument("--save-to-disk", help="Path where to save downloaded files", type=str, default=None)
   parser.add_argument("--deferred-assembly",
-                      help="When to assemble and save files: 'per-file' (default) or 'all-files'",
+                      help="When to assemble and save files (only applies when save-to-disk is enabled): 'per-file' (default) or 'all-files'",
                       choices=['per-file', 'all-files'], default='per-file')
 
   args = parser.parse_args()
@@ -514,9 +514,14 @@ def main():
   # Convert args to dictionary for pickling
   args_dict = vars(args)
 
-  if args.deferred_assembly == 'all-files':
+  # Determine if we should use deferred assembly
+  # Only consider deferred assembly if save-to-disk is enabled
+  use_deferred_assembly = args.save_to_disk and args.deferred_assembly == 'all-files'
+
+  if use_deferred_assembly:
     # ==== TWO-PHASE APPROACH: DOWNLOAD EVERYTHING FIRST, THEN REASSEMBLE ====
     print("\n===== PHASE 1: DOWNLOADING ALL FILE PARTS =====")
+    print(f"Using deferred assembly mode: download all files first, then save to disk")
     download_start = datetime.now()
 
     # Use ProcessPoolExecutor to handle multiple files in parallel
@@ -565,8 +570,12 @@ def main():
       validation_results = download_results
 
   else:
-    # ==== ORIGINAL APPROACH: DOWNLOAD AND SAVE EACH FILE INDEPENDENTLY ====
+    # ==== ORIGINAL APPROACH: DOWNLOAD AND PROCESS EACH FILE INDEPENDENTLY ====
     print("\n===== DOWNLOADING AND PROCESSING FILES INDIVIDUALLY =====")
+    if args.save_to_disk:
+      print(f"Using standard assembly mode: files will be saved as they are downloaded")
+    else:
+      print(f"No save-to-disk specified: files will be downloaded to memory only")
     download_start = datetime.now()
 
     # Use ProcessPoolExecutor to handle multiple files in parallel
@@ -667,11 +676,12 @@ def main():
     total_throughput = agg_stats["total_throughput"]
     print(f"\nTotal Combined Throughput: {total_throughput:.2f} MiB/sec")
     print(f"Total Duration: {(end_time - start_time).total_seconds():.2f} seconds")
-    print(f"Assembly Mode: {args.deferred_assembly}")
 
-    if args.deferred_assembly == 'all-files' and args.save_to_disk:
-      print(f"  - Download phase: {download_duration:.2f} seconds")
-      print(f"  - Save phase: {save_duration:.2f} seconds")
+    if args.save_to_disk:
+      print(f"Assembly Mode: {args.deferred_assembly}")
+      if use_deferred_assembly:
+        print(f"  - Download phase: {download_duration:.2f} seconds")
+        print(f"  - Save phase: {save_duration:.2f} seconds")
   else:
     print("No successful downloads to report.")
 
