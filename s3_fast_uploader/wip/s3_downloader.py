@@ -71,13 +71,16 @@ def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_c
 
 def download_part_worker(args):
   """Worker function for downloading a part of a file"""
-  if len(args) > 8:  # Check if we're using the new format with file_index and part_index
+  # Check the number of arguments to determine which format we're using
+  if len(args) == 11:  # Extended format with file_index and part_index
     bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, save_to_disk, file_index, part_index = args
     include_indices = True
-  else:  # Original format for backwards compatibility
+  elif len(args) == 9:  # Original format for compatibility with process_single_file
     bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, save_to_disk = args
     include_indices = False
     file_index = part_index = 0
+  else:
+    raise ValueError(f"Unexpected number of arguments: {len(args)}")
 
   # Create a fresh client for this worker
   s3_client = create_boto3_client(
@@ -176,6 +179,8 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
       while position < content_length:
         end_position = min(position + multipart_size - 1, content_length - 1)
 
+        # Note: We're using the original parameter format (9 parameters)
+        # This is compatible with the updated download_part_worker function
         download_parts.append((
           bucket_name,
           file_key,
@@ -348,6 +353,7 @@ def download_file_parts(args_dict, file_index, file_key):
       while position < content_length:
         end_position = min(position + multipart_size - 1, content_length - 1)
 
+        # Add file_index and part_index to the tuple
         download_parts.append((
           bucket_name,
           file_key,
