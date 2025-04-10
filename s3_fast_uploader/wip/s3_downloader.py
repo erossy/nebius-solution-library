@@ -110,6 +110,185 @@ def download_part_worker(args):
     raise
 
 
+def process_single_file(args_dict, file_index, timestamp, file_key):
+  """Process a single file download and return information needed for validation"""
+  # Extract parameters from the dictionary
+  bucket_name = args_dict['bucket_name']
+  concurrency = args_dict['concurrency']
+  multipart_size_mb = args_dict['multipart_size_mb']
+  object_size_mb = args_dict['object_size_mb']
+  endpoint_url = args_dict['endpoint_url']
+  access_key = args_dict['access_key_aws_id']
+  secret_key = args_dict['secret_access_key']
+  region = args_dict['region_name']
+  max_pool_connections = args_dict['max_pool_connections']
+  prefix = args_dict.get('prefix')
+  save_to_disk = args_dict.get('save_to_disk', None)
+
+  # Create a client for the main operations
+  s3_client = create_boto3_client(
+    access_key=access_key,
+    secret_key=secret_key,
+    region=region,
+    endpoint_url=endpoint_url,
+    max_pool_connections=max_pool_connections
+  )
+
+  # Calculate actual multipart size in bytes
+  multipart_size = multipart_size_mb * 1024 * 1024
+
+  operation_start = time.time()
+  retry_count = 0
+  max_retries = 10
+
+  # For download with prefix, get the actual file size
+  if prefix:
+    try:
+      # Get the actual file size for existing files with prefix
+      head_res = s3_client.head_object(Bucket=bucket_name, Key=file_key)
+      object_size_mb = int(head_res['ContentLength']) / (1024 * 1024)
+      file_display_name = file_key  # Use the original key name for display
+    except Exception as e:
+      print(f"Warning: Failed to get size for {file_key}: {e}")
+      file_display_name = f"file_{file_index}"
+  else:
+    file_display_name = f"file_{file_index}"
+
+  # Prepare output path if saving to disk
+  if save_to_disk:
+    # Create a clean filename based on the file_key
+    safe_filename = os.path.basename(file_key).replace('/', '_')
+    output_path = os.path.join(save_to_disk, safe_filename)
+  else:
+    output_path = None
+
+  # Main processing loop with retries
+  while retry_count <= max_retries:
+    try:
+      # Get the object size
+      head_res = s3_client.head_object(Bucket=bucket_name, Key=file_key)
+      content_length = int(head_res['ContentLength'])
+
+      # Calculate parts for download
+      download_parts = []
+      position = 0
+
+      while position < content_length:
+        end_position = min(position + multipart_size - 1, content_length - 1)
+
+        download_parts.append((
+          bucket_name,
+          file_key,
+          position,
+          end_position,
+          endpoint_url,
+          access_key,
+          secret_key,
+          region,
+          save_to_disk is not None  # Need to keep data if we're saving to disk
+        ))
+
+        position = end_position + 1
+
+      # Download parts in parallel
+      with multiprocessing.Pool(processes=concurrency) as pool:
+        results = pool.map(download_part_worker, download_parts)
+
+      # If saving to disk, reassemble the file
+      if save_to_disk:
+        # Sort results by start position
+        sorted_results = sorted(results, key=lambda x: x[0])
+
+        # Concatenate all parts
+        complete_file = b''.join([chunk for _, chunk in sorted_results])
+
+        # Save to disk without immediate validation
+        if output_path:
+          try:
+            with open(output_path, 'wb') as f:
+              f.write(complete_file)
+            print(f"Downloaded {file_display_name} to {output_path}")
+          except Exception as e:
+            print(colored(f"Error saving file to disk: {e}", "red"))
+            # Return error info for validation phase
+            return {
+              'file_key': file_key,
+              'file_display_name': file_display_name,
+              'download_success': False,
+              'content_length': content_length,
+              'download_size': 0,
+              'output_path': output_path,
+              'error': str(e),
+              'throughput_mb': 0
+            }
+
+        # If we get here, the download was successful
+        # Calculate throughput
+        operation_end = time.time()
+        duration = operation_end - operation_start
+        throughput_mb = object_size_mb / duration
+
+        print(colored(
+          f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
+          "green"
+        ))
+
+        # Return information needed for later validation
+        return {
+          'file_key': file_key,
+          'file_display_name': file_display_name,
+          'download_success': True,
+          'content_length': content_length,
+          'download_size': len(complete_file) if save_to_disk else sum(results),
+          'output_path': output_path,
+          'throughput_mb': throughput_mb
+        }
+      else:
+        # If not saving to disk, just calculate the size from the results
+        total_downloaded = sum(results)
+
+        # Calculate throughput
+        operation_end = time.time()
+        duration = operation_end - operation_start
+        throughput_mb = object_size_mb / duration
+
+        print(colored(
+          f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
+          "green"
+        ))
+
+        # Return information without validation
+        return {
+          'file_key': file_key,
+          'file_display_name': file_display_name,
+          'download_success': True,
+          'content_length': content_length,
+          'download_size': total_downloaded,
+          'output_path': None,
+          'throughput_mb': throughput_mb
+        }
+
+      # If we get here, the operation was successful
+      break
+
+    except Exception as e:
+      retry_count += 1
+      if retry_count > max_retries:
+        print(f"Failed to process {file_display_name} after {max_retries} retries: {e}")
+        return {
+          'file_key': file_key,
+          'file_display_name': file_display_name,
+          'download_success': False,
+          'content_length': 0,
+          'download_size': 0,
+          'output_path': output_path if save_to_disk else None,
+          'error': str(e),
+          'throughput_mb': 0
+        }
+      print(f"Error processing {file_display_name} (attempt {retry_count}/{max_retries}): {e}")
+      time.sleep(1)  # Wait before retrying
+
+
 def download_file_parts(args_dict, file_index, file_key):
   """Download all parts of a file and return them for later reassembly"""
   # Extract parameters from the dictionary
