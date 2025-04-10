@@ -1,6 +1,6 @@
 # S3 High-Performance Downloader
 
-A robust, high-performance utility for downloading files from S3-compatible storage with optimized multi-threaded and multi-process approaches.
+A tool for downloading files from S3-compatible storage with optimized multi-threaded and multi-process approaches.
 
 ## Table of Contents
 
@@ -26,17 +26,6 @@ This tool provides high-throughput downloads from S3-compatible object storage b
 - Direct streaming to disk with optimized I/O
 - Auto-optimization based on system capabilities
 - Comprehensive benchmarking and validation
-
-## Features
-
-- **High Performance**: Optimized for maximum throughput using parallel downloads
-- **Flexible Usage**: Download individual files or entire prefixes
-- **Streaming Mode**: Direct streaming to disk for memory efficiency 
-- **Auto-Optimization**: Automatically tunes parameters based on CPU count and file characteristics
-- **Robust Error Handling**: Retries with exponential backoff
-- **Detailed Metrics**: Reports throughput statistics and performance data
-- **File Validation**: Verifies downloaded file integrity
-- **Benchmark Mode**: Upload test files for performance testing
 
 ## Requirements
 
