@@ -49,8 +49,6 @@ def parse_args():
   parser.add_argument("--chunk-size-kb", help="Chunk size in KB for streaming", type=int, default=1024)
   parser.add_argument("--auto-optimize", help="Automatically optimize parameters for CPU", action="store_true",
                       default=False)
-  parser.add_argument("--no-auto-optimize", help="Disable automatic parameter optimization", action="store_false",
-                      dest="auto_optimize")
 
   args = parser.parse_args()
 
