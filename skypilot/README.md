@@ -36,7 +36,7 @@ The `examples` directory contains several YAML configurations that demonstrate d
 Run a simple job to verify GPU access:
 
 ```bash
-$ sky launch -c basic-terraform examples/basic-job.yaml
+$ sky launch -c basic-terraform_to_spawn_env examples/basic-job.yaml
 ...
 (task, pid=3791) Do we have GPUs?
 (task, pid=3791) Mon Mar 24 11:57:22 2025       
@@ -68,7 +68,7 @@ This example launches a single node with 8 H100 GPUs and runs `nvidia-smi` to ve
 Run a job that mounts Nebius Object Storage to filesystem:
 
 ```bash
-$ sky launch -c terraform-cloud-bucket examples/terraform-cloud-bucket.yaml
+$ sky launch -c terraform_to_spawn_env-cloud-bucket examples/terraform_to_spawn_env-cloud-bucket.yaml
 ...
 (task, pid=3791) total 377487364
 (task, pid=3791) -rw-r--r-- 1 ubuntu ubuntu 32212254720 Mar 10 14:21 file_1
@@ -108,7 +108,7 @@ This example distributes the same minGPT training across 2 nodes, each with 8 H1
 Verify high-speed Infiniband connectivity between nodes:
 
 ```bash
-sky launch -c ib-terraform examples/infiniband-terraform.yaml
+sky launch -c ib-terraform_to_spawn_env examples/infiniband-terraform_to_spawn_env.yaml
 ```
 
 This example launches 2 nodes and tests the Infiniband bandwidth between them using the `ib_send_bw` utility.

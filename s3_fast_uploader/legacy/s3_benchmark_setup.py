@@ -32,13 +32,13 @@ def prepare_test_files(
     num_files_per_size=10
 ):
     """
-    Generate and upload terraform files of specific sizes to S3 bucket.
+    Generate and upload terraform_to_spawn_env files of specific sizes to S3 bucket.
     Files are uploaded using multipart upload to handle large files efficiently.
 
     Args:
         s3_client: Boto3 S3 client
         bucket_name: Target S3 bucket name
-        prefix: Key prefix for terraform files
+        prefix: Key prefix for terraform_to_spawn_env files
         file_sizes_mb: List of file sizes in MB to generate
         num_files_per_size: Number of files to generate for each size
 
@@ -48,7 +48,7 @@ def prepare_test_files(
     import io
     import random
 
-    print("Preparing terraform files...")
+    print("Preparing terraform_to_spawn_env files...")
     file_keys = {size: [] for size in file_sizes_mb}
 
     for size_mb in file_sizes_mb:
@@ -938,14 +938,14 @@ def run_performance_tests(
         region_name: AWS region
         bucket: S3 bucket name
         keys: Dictionary mapping file size to list of keys
-        file_sizes: List of file sizes to terraform
-        test_dir: Base directory for terraform files
+        file_sizes: List of file sizes to terraform_to_spawn_env
+        test_dir: Base directory for terraform_to_spawn_env files
         include_baseline: Whether to include slower baseline methods
-        processes_list: List of process counts to terraform
-        concurrency_list: List of concurrency values to terraform
+        processes_list: List of process counts to terraform_to_spawn_env
+        concurrency_list: List of concurrency values to terraform_to_spawn_env
 
     Returns:
-        List of dictionaries with terraform results
+        List of dictionaries with terraform_to_spawn_env results
     """
     # Import the actual high-performance downloader
     try:
@@ -1000,7 +1000,7 @@ def run_performance_tests(
                     aioboto3_stats['file_size_mb'] = size_mb
                     results.append(aioboto3_stats)
                 except Exception as e:
-                    print(f"Error running aioboto3 terraform: {str(e)}")
+                    print(f"Error running aioboto3 terraform_to_spawn_env: {str(e)}")
 
             # Multiprocessing boto3
             for processes in [2, 4, 8]:
@@ -1053,10 +1053,10 @@ def run_performance_tests(
 
 def visualize_results(results, output_dir):
     """
-    Create visualizations of terraform results.
+    Create visualizations of terraform_to_spawn_env results.
 
     Args:
-        results: List of dictionaries with terraform results
+        results: List of dictionaries with terraform_to_spawn_env results
         output_dir: Directory to save visualizations
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -1127,14 +1127,14 @@ def main():
     parser.add_argument('--secret-key', required=True, help='AWS secret access key')
     parser.add_argument('--region', default=None, help='AWS region')
     parser.add_argument('--bucket', required=True, help='S3 bucket name')
-    parser.add_argument('--prefix', default='terraform', help='Key prefix for terraform files')
-    parser.add_argument('--output-dir', default='./s3_performance_tests', help='Output directory for terraform results')
-    parser.add_argument('--prepare-files', action='store_true', help='Generate and upload terraform files')
-    parser.add_argument('--file-sizes', type=int, nargs='+', default=[10, 100, 512], help='File sizes to terraform in MB')
+    parser.add_argument('--prefix', default='terraform_to_spawn_env', help='Key prefix for terraform_to_spawn_env files')
+    parser.add_argument('--output-dir', default='./s3_performance_tests', help='Output directory for terraform_to_spawn_env results')
+    parser.add_argument('--prepare-files', action='store_true', help='Generate and upload terraform_to_spawn_env files')
+    parser.add_argument('--file-sizes', type=int, nargs='+', default=[10, 100, 512], help='File sizes to terraform_to_spawn_env in MB')
     parser.add_argument('--files-per-size', type=int, default=10, help='Number of files per size category')
     parser.add_argument('--skip-baseline', action='store_true', help='Skip baseline (slower) methods')
-    parser.add_argument('--processes', type=int, nargs='+', default=[1, 2, 4, 8], help='Process counts to terraform')
-    parser.add_argument('--concurrency', type=int, nargs='+', default=[10, 25, 50], help='Concurrency values to terraform')
+    parser.add_argument('--processes', type=int, nargs='+', default=[1, 2, 4, 8], help='Process counts to terraform_to_spawn_env')
+    parser.add_argument('--concurrency', type=int, nargs='+', default=[10, 25, 50], help='Concurrency values to terraform_to_spawn_env')
 
     args = parser.parse_args()
 
@@ -1156,7 +1156,7 @@ def main():
 
     start_time = time.time()
 
-    # Prepare terraform files if requested
+    # Prepare terraform_to_spawn_env files if requested
     if args.prepare_files:
         file_keys = prepare_test_files(
             s3_client,
@@ -1182,7 +1182,7 @@ def main():
         for size, keys in file_keys.items():
             print(f"Found {len(keys)} files of size {size} MB")
             if len(keys) == 0:
-                print(f"Error: No files found for size {size} MB. Use --prepare-files to generate terraform files.")
+                print(f"Error: No files found for size {size} MB. Use --prepare-files to generate terraform_to_spawn_env files.")
                 return
             if len(keys) > args.files_per_size:
                 file_keys[size] = keys[:args.files_per_size]
