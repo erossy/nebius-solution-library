@@ -30,6 +30,7 @@ def parse_args():
   parser.add_argument("--max-pool-connections", help="Max boto3 connection pool size", type=int, default=100)
   parser.add_argument("--prefix", help="Only download files with this prefix", type=str, default=None)
   parser.add_argument("--save-to-disk", help="Path where to save downloaded files", type=str, default=None)
+  # Keep deferred-assembly flag for backward compatibility, but we'll always use the optimized in-memory approach
   parser.add_argument("--deferred-assembly",
                       help="When to assemble and save files (only applies when save-to-disk is enabled): 'per-file' (default) or 'all-files'",
                       choices=['per-file', 'all-files'], default='per-file')
@@ -71,16 +72,7 @@ def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_c
 
 def download_part_worker(args):
   """Worker function for downloading a part of a file"""
-  # Check the number of arguments to determine which format we're using
-  if len(args) == 11:  # Extended format with file_index and part_index
-    bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, save_to_disk, file_index, part_index = args
-    include_indices = True
-  elif len(args) == 9:  # Original format for compatibility with process_single_file
-    bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, save_to_disk = args
-    include_indices = False
-    file_index = part_index = 0
-  else:
-    raise ValueError(f"Unexpected number of arguments: {len(args)}")
+  bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, file_index, part_index = args
 
   # Create a fresh client for this worker
   s3_client = create_boto3_client(
@@ -97,205 +89,17 @@ def download_part_worker(args):
       Key=object_key,
       Range=f"bytes={start_byte}-{end_byte}"
     )
-    # Read data
+    # Read data - always keep the data in memory
     chunk = response['Body'].read()
-    if save_to_disk:
-      if include_indices:
-        # Return file_index, part_index, position and data for later reassembly
-        return file_index, part_index, start_byte, chunk
-      else:
-        # Original format for backward compatibility
-        return start_byte, chunk
-    else:
-      return len(chunk)  # Just return the size we processed
+    # Return file_index, part_index, position and data for later reassembly
+    return file_index, part_index, start_byte, chunk
   except Exception as e:
     print(f"Error downloading part of {object_key} ({start_byte}-{end_byte}): {e}")
     raise
 
 
-def process_single_file(args_dict, file_index, timestamp, file_key):
-  """Process a single file download and return information needed for validation"""
-  # Extract parameters from the dictionary
-  bucket_name = args_dict['bucket_name']
-  concurrency = args_dict['concurrency']
-  multipart_size_mb = args_dict['multipart_size_mb']
-  object_size_mb = args_dict['object_size_mb']
-  endpoint_url = args_dict['endpoint_url']
-  access_key = args_dict['access_key_aws_id']
-  secret_key = args_dict['secret_access_key']
-  region = args_dict['region_name']
-  max_pool_connections = args_dict['max_pool_connections']
-  prefix = args_dict.get('prefix')
-  save_to_disk = args_dict.get('save_to_disk', None)
-
-  # Create a client for the main operations
-  s3_client = create_boto3_client(
-    access_key=access_key,
-    secret_key=secret_key,
-    region=region,
-    endpoint_url=endpoint_url,
-    max_pool_connections=max_pool_connections
-  )
-
-  # Calculate actual multipart size in bytes
-  multipart_size = multipart_size_mb * 1024 * 1024
-
-  operation_start = time.time()
-  retry_count = 0
-  max_retries = 10
-
-  # For download with prefix, get the actual file size
-  if prefix:
-    try:
-      # Get the actual file size for existing files with prefix
-      head_res = s3_client.head_object(Bucket=bucket_name, Key=file_key)
-      object_size_mb = int(head_res['ContentLength']) / (1024 * 1024)
-      file_display_name = file_key  # Use the original key name for display
-    except Exception as e:
-      print(f"Warning: Failed to get size for {file_key}: {e}")
-      file_display_name = f"file_{file_index}"
-  else:
-    file_display_name = f"file_{file_index}"
-
-  # Prepare output path if saving to disk
-  if save_to_disk:
-    # Create a clean filename based on the file_key
-    safe_filename = os.path.basename(file_key).replace('/', '_')
-    output_path = os.path.join(save_to_disk, safe_filename)
-  else:
-    output_path = None
-
-  # Main processing loop with retries
-  while retry_count <= max_retries:
-    try:
-      # Get the object size
-      head_res = s3_client.head_object(Bucket=bucket_name, Key=file_key)
-      content_length = int(head_res['ContentLength'])
-
-      # Calculate parts for download
-      download_parts = []
-      position = 0
-
-      while position < content_length:
-        end_position = min(position + multipart_size - 1, content_length - 1)
-
-        # Note: We're using the original parameter format (9 parameters)
-        # This is compatible with the updated download_part_worker function
-        download_parts.append((
-          bucket_name,
-          file_key,
-          position,
-          end_position,
-          endpoint_url,
-          access_key,
-          secret_key,
-          region,
-          save_to_disk is not None  # Need to keep data if we're saving to disk
-        ))
-
-        position = end_position + 1
-
-      # Download parts in parallel
-      with multiprocessing.Pool(processes=concurrency) as pool:
-        results = pool.map(download_part_worker, download_parts)
-
-      # If saving to disk, reassemble the file
-      if save_to_disk:
-        # Sort results by start position
-        sorted_results = sorted(results, key=lambda x: x[0])
-
-        # Concatenate all parts
-        complete_file = b''.join([chunk for _, chunk in sorted_results])
-
-        # Save to disk without immediate validation
-        if output_path:
-          try:
-            with open(output_path, 'wb') as f:
-              f.write(complete_file)
-            print(f"Downloaded {file_display_name} to {output_path}")
-          except Exception as e:
-            print(colored(f"Error saving file to disk: {e}", "red"))
-            # Return error info for validation phase
-            return {
-              'file_key': file_key,
-              'file_display_name': file_display_name,
-              'download_success': False,
-              'content_length': content_length,
-              'download_size': 0,
-              'output_path': output_path,
-              'error': str(e),
-              'throughput_mb': 0
-            }
-
-        # If we get here, the download was successful
-        # Calculate throughput
-        operation_end = time.time()
-        duration = operation_end - operation_start
-        throughput_mb = object_size_mb / duration
-
-        print(colored(
-          f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
-          "green"
-        ))
-
-        # Return information needed for later validation
-        return {
-          'file_key': file_key,
-          'file_display_name': file_display_name,
-          'download_success': True,
-          'content_length': content_length,
-          'download_size': len(complete_file) if save_to_disk else sum(results),
-          'output_path': output_path,
-          'throughput_mb': throughput_mb
-        }
-      else:
-        # If not saving to disk, just calculate the size from the results
-        total_downloaded = sum(results)
-
-        # Calculate throughput
-        operation_end = time.time()
-        duration = operation_end - operation_start
-        throughput_mb = object_size_mb / duration
-
-        print(colored(
-          f"{file_display_name}: size={object_size_mb:.2f}MB, duration={duration:.2f}s, throughput={throughput_mb:.2f} MiB/sec",
-          "green"
-        ))
-
-        # Return information without validation
-        return {
-          'file_key': file_key,
-          'file_display_name': file_display_name,
-          'download_success': True,
-          'content_length': content_length,
-          'download_size': total_downloaded,
-          'output_path': None,
-          'throughput_mb': throughput_mb
-        }
-
-      # If we get here, the operation was successful
-      break
-
-    except Exception as e:
-      retry_count += 1
-      if retry_count > max_retries:
-        print(f"Failed to process {file_display_name} after {max_retries} retries: {e}")
-        return {
-          'file_key': file_key,
-          'file_display_name': file_display_name,
-          'download_success': False,
-          'content_length': 0,
-          'download_size': 0,
-          'output_path': output_path if save_to_disk else None,
-          'error': str(e),
-          'throughput_mb': 0
-        }
-      print(f"Error processing {file_display_name} (attempt {retry_count}/{max_retries}): {e}")
-      time.sleep(1)  # Wait before retrying
-
-
 def download_file_parts(args_dict, file_index, file_key):
-  """Download all parts of a file and return them for later reassembly"""
+  """Download all parts of a file to memory and return them for later reassembly"""
   # Extract parameters from the dictionary
   bucket_name = args_dict['bucket_name']
   concurrency = args_dict['concurrency']
@@ -353,7 +157,7 @@ def download_file_parts(args_dict, file_index, file_key):
       while position < content_length:
         end_position = min(position + multipart_size - 1, content_length - 1)
 
-        # Add file_index and part_index to the tuple
+        # Add args for the worker function - Note we're always keeping data in memory
         download_parts.append((
           bucket_name,
           file_key,
@@ -363,7 +167,6 @@ def download_file_parts(args_dict, file_index, file_key):
           access_key,
           secret_key,
           region,
-          save_to_disk is not None,  # Need to keep data if we're saving to disk
           file_index,
           part_index
         ))
@@ -374,6 +177,13 @@ def download_file_parts(args_dict, file_index, file_key):
       # Download parts in parallel
       with multiprocessing.Pool(processes=concurrency) as pool:
         results = pool.map(download_part_worker, download_parts)
+
+      # Important: We assemble the file in memory here regardless of save_to_disk
+      # Sort results by part index to ensure correct order
+      sorted_results = sorted(results, key=lambda x: x[1])
+
+      # Concatenate all parts - this is done in memory for both modes
+      complete_file = b''.join([chunk for _, _, _, chunk in sorted_results])
 
       # Calculate throughput
       operation_end = time.time()
@@ -393,7 +203,7 @@ def download_file_parts(args_dict, file_index, file_key):
         'download_success': True,
         'content_length': content_length,
         'output_path': output_path,
-        'results': results,
+        'assembled_file': complete_file,  # Return the assembled file directly
         'throughput_mb': throughput_mb,
         'save_to_disk': save_to_disk is not None
       }
@@ -417,55 +227,33 @@ def download_file_parts(args_dict, file_index, file_key):
       time.sleep(1)  # Wait before retrying
 
 
-def reassemble_and_save_files(download_results):
-  """Reassemble and save all successfully downloaded files"""
-  print("\nReassembling and saving downloaded files...")
+def save_files_to_disk(download_results):
+  """Save all successfully downloaded and assembled files to disk"""
+  print("\nSaving files to disk...")
 
   # Filter for successful downloads that need to be saved
   save_tasks = [result for result in download_results if result['download_success'] and result['save_to_disk']]
 
-  # Group results by file_index to organize parts
-  files_to_save = {}
-  for task in save_tasks:
-    file_index = task['file_index']
-    if file_index not in files_to_save:
-      files_to_save[file_index] = task
-
   save_results = []
 
-  for file_index, file_info in files_to_save.items():
+  for file_info in save_tasks:
     try:
-      # Get all parts for this file
-      file_parts = []
-      for result in file_info['results']:
-        if isinstance(result, tuple) and len(result) >= 4:
-          # Extract the correct tuple elements (file_index, part_index, start_byte, chunk)
-          if result[0] == file_index:  # Ensure this part belongs to the current file
-            file_parts.append((result[2], result[3]))  # (start_byte, chunk)
-
-      # Sort by start position
-      sorted_parts = sorted(file_parts, key=lambda x: x[0])
-
-      # Concatenate all parts
-      complete_file = b''.join([chunk for _, chunk in sorted_parts])
-
-      # Save to disk
       output_path = file_info['output_path']
       if output_path:
         with open(output_path, 'wb') as f:
-          f.write(complete_file)
+          f.write(file_info['assembled_file'])
         print(colored(f"✓ {file_info['file_display_name']}: Saved to {output_path}", "green"))
 
         # Add validation info
-        file_info['validation_success'] = len(complete_file) == file_info['content_length']
+        file_info['validation_success'] = len(file_info['assembled_file']) == file_info['content_length']
         if not file_info['validation_success']:
           file_info[
-            'validation_error'] = f"Size mismatch: expected {file_info['content_length']} bytes, got {len(complete_file)} bytes"
+            'validation_error'] = f"Size mismatch: expected {file_info['content_length']} bytes, got {len(file_info['assembled_file'])} bytes"
           print(colored(f"✗ Validation failed for {file_info['file_display_name']}: {file_info['validation_error']}",
                         "red"))
 
         # Update download_size for statistics
-        file_info['download_size'] = len(complete_file)
+        file_info['download_size'] = len(file_info['assembled_file'])
 
       save_results.append(file_info)
     except Exception as e:
@@ -479,8 +267,8 @@ def reassemble_and_save_files(download_results):
 
 def upload_test_file(bucket_name, object_key, object_size_mb, concurrency, multipart_size_mb,
                      endpoint_url, access_key, secret_key, region):
-  """Upload a terraform file for download benchmarking"""
-  print(f"Uploading terraform file {object_key} of size {object_size_mb}MB...")
+  """Upload a test file for download benchmarking"""
+  print(f"Uploading test file {object_key} of size {object_size_mb}MB...")
 
   # Create a client
   s3_client = create_boto3_client(
@@ -699,100 +487,53 @@ def main():
   # Convert args to dictionary for pickling
   args_dict = vars(args)
 
-  # Determine if we should use deferred assembly
-  # Only consider deferred assembly if save-to-disk is enabled
-  use_deferred_assembly = args.save_to_disk and args.deferred_assembly == 'all-files'
+  # ==== OPTIMIZED APPROACH: DOWNLOAD & ASSEMBLE EVERYTHING FIRST, THEN SAVE TO DISK IF NEEDED ====
+  print("\n===== PHASE 1: DOWNLOADING AND ASSEMBLING ALL FILES IN MEMORY =====")
+  download_start = datetime.now()
 
-  if use_deferred_assembly:
-    # ==== TWO-PHASE APPROACH: DOWNLOAD EVERYTHING FIRST, THEN REASSEMBLE ====
-    print("\n===== PHASE 1: DOWNLOADING ALL FILE PARTS =====")
-    print(f"Using deferred assembly mode: download all files first, then save to disk")
-    download_start = datetime.now()
+  # Use ProcessPoolExecutor to handle multiple files in parallel
+  with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+    futures = []
 
-    # Use ProcessPoolExecutor to handle multiple files in parallel
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-      futures = []
+    # Submit all file downloading tasks
+    for i, file_key in enumerate(file_keys):
+      future = executor.submit(
+        download_file_parts,
+        args_dict,
+        i,
+        file_key
+      )
+      futures.append(future)
 
-      # Submit all file downloading tasks
-      for i, file_key in enumerate(file_keys):
-        future = executor.submit(
-          download_file_parts,
-          args_dict,
-          i,
-          file_key
-        )
-        futures.append(future)
+    # Collect results as they complete
+    for future in concurrent.futures.as_completed(futures):
+      try:
+        result = future.result()
+        download_results.append(result)
+        if result['download_success']:
+          throughputs.append(result['throughput_mb'])
+      except Exception as e:
+        print(f"File processing failed: {e}")
 
-      # Collect results as they complete
-      for future in concurrent.futures.as_completed(futures):
-        try:
-          result = future.result()
-          download_results.append(result)
-          if result['download_success']:
-            throughputs.append(result['throughput_mb'])
-        except Exception as e:
-          print(f"File processing failed: {e}")
+  download_end = datetime.now()
+  download_duration = (download_end - download_start).total_seconds()
+  print(f"\nDownload and assembly phase completed in {download_duration:.2f} seconds")
 
-    download_end = datetime.now()
-    download_duration = (download_end - download_start).total_seconds()
-    print(f"\nDownload phase completed in {download_duration:.2f} seconds")
+  # Save phase - only if needed
+  if args.save_to_disk:
+    print("\n===== PHASE 2: SAVING FILES TO DISK =====")
+    save_start = datetime.now()
 
-    # Reassembly and save phase
-    if args.save_to_disk:
-      print("\n===== PHASE 2: REASSEMBLING AND SAVING FILES =====")
-      save_start = datetime.now()
+    # Save all files
+    save_results = save_files_to_disk(download_results)
 
-      # Reassemble and save all files
-      save_results = reassemble_and_save_files(download_results)
+    save_end = datetime.now()
+    save_duration = (save_end - save_start).total_seconds()
+    print(f"\nSave phase completed in {save_duration:.2f} seconds")
 
-      save_end = datetime.now()
-      save_duration = (save_end - save_start).total_seconds()
-      print(f"\nSave phase completed in {save_duration:.2f} seconds")
-
-      # Validate saved files
-      validation_results = validate_downloaded_files(save_results, args)
-    else:
-      validation_results = download_results
-
+    # Validate saved files
+    validation_results = validate_downloaded_files(save_results, args)
   else:
-    # ==== ORIGINAL APPROACH: DOWNLOAD AND PROCESS EACH FILE INDEPENDENTLY ====
-    print("\n===== DOWNLOADING AND PROCESSING FILES INDIVIDUALLY =====")
-    if args.save_to_disk:
-      print(f"Using standard assembly mode: files will be saved as they are downloaded")
-    else:
-      print(f"No save-to-disk specified: files will be downloaded to memory only")
-    download_start = datetime.now()
-
-    # Use ProcessPoolExecutor to handle multiple files in parallel
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-      futures = []
-
-      # Submit all file processing tasks
-      for i, file_key in enumerate(file_keys):
-        future = executor.submit(
-          process_single_file,  # Use the original function that downloads and saves per file
-          args_dict,
-          i,
-          timestamp,
-          file_key
-        )
-        futures.append(future)
-
-      # Collect results as they complete
-      for future in concurrent.futures.as_completed(futures):
-        try:
-          result = future.result()
-          download_results.append(result)
-          if result['download_success']:
-            throughputs.append(result['throughput_mb'])
-        except Exception as e:
-          print(f"File processing failed: {e}")
-
-    download_end = datetime.now()
-    download_duration = (download_end - download_start).total_seconds()
-    print(f"\nAll files processed in {download_duration:.2f} seconds")
-
-    # For per-file approach, validation happens inside process_single_file
     validation_results = download_results
 
   end_time = datetime.now()
@@ -823,7 +564,7 @@ def main():
       "mode": "download",
       "object_size_mb": args.object_size_mb,
       "num_iterations": args.iteration_number,
-      "assembly_mode": args.deferred_assembly,
+      "assembly_mode": "optimized-in-memory",  # Always using optimized mode now
       "throughput_percentile": {
         "p0": float(f"{percentiles[0]:.2f}"),
         "p5": float(f"{percentiles[1]:.2f}"),
@@ -863,10 +604,9 @@ def main():
     print(f"Total Duration: {(end_time - start_time).total_seconds():.2f} seconds")
 
     if args.save_to_disk:
-      print(f"Assembly Mode: {args.deferred_assembly}")
-      if use_deferred_assembly:
-        print(f"  - Download phase: {download_duration:.2f} seconds")
-        print(f"  - Save phase: {save_duration:.2f} seconds")
+      print(f"Assembly Mode: optimized-in-memory")
+      print(f"  - Download phase: {download_duration:.2f} seconds")
+      print(f"  - Save phase: {save_duration:.2f} seconds")
   else:
     print("No successful downloads to report.")
 
