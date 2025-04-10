@@ -1,3 +1,4 @@
+#good
 import argparse
 import json
 import multiprocessing
@@ -5,9 +6,6 @@ import time
 import concurrent.futures
 from datetime import datetime
 import os
-import subprocess
-import sys
-import tempfile
 
 import boto3
 import boto3.s3.transfer
@@ -25,6 +23,7 @@ def parse_args():
   parser.add_argument("--endpoint-url", help="Endpoint URL", required=True)
   parser.add_argument("--bucket-name", help="Bucket Name", required=True)
   parser.add_argument("--filename-suffix", help="Filename suffix (can be without _ in the end)", required=False)
+  parser.add_argument("--mode", help="Testing Mode", choices=["upload", "download"], required=True)
   parser.add_argument("--iteration-number", help="Iteration Number", type=int, required=True)
   parser.add_argument("--object-size-mb", help="Object Size in MB", type=int, required=True)
   parser.add_argument("--concurrency", help="Concurrency per file", type=int, required=True)
@@ -32,64 +31,11 @@ def parse_args():
   parser.add_argument("--file-parallelism", help="Number of files to download in parallel", type=int, default=4)
   parser.add_argument("--max-pool-connections", help="Max boto3 connection pool size", type=int, default=100)
   parser.add_argument("--prefix", help="Only download files with this prefix", type=str, default=None)
-  parser.add_argument("--persist-downloads", help="Keep downloaded files in memory for validation", action="store_true")
-  parser.add_argument("--delete-previous", help="Delete previous files with the same prefix before starting",
-                      action="store_true")
-  parser.add_argument("--save-to-ramdisk", help="Save downloaded files to a ramdisk", action="store_true")
-  parser.add_argument("--ramdisk-size-mb", help="Size of ramdisk in MB", type=int, default=1024)
-  parser.add_argument("--ramdisk-path", help="Mount point for ramdisk", type=str, default="/mnt/ramdisk")
 
   args = parser.parse_args()
 
   print(f"Arguments were parsed: {args}")
   return args
-
-
-def create_ramdisk(size_mb, mount_path):
-  """Create a ramdisk of specified size at the given mount path if it doesn't exist already"""
-  # Check if we're root, required for ramdisk operations
-  if os.geteuid() != 0:
-    print(colored("Error: Root privileges required to create ramdisk. Please run with sudo.", "red"))
-    print(colored("Continuing without ramdisk...", "yellow"))
-    return False
-
-  # Create mount point if it doesn't exist
-  if not os.path.exists(mount_path):
-    try:
-      os.makedirs(mount_path, exist_ok=True)
-      print(f"Created mount point at {mount_path}")
-    except Exception as e:
-      print(colored(f"Error creating mount point: {e}", "red"))
-      return False
-
-  # Check if it's already mounted as tmpfs
-  try:
-    mount_check = subprocess.run(["mount", "-t", "tmpfs"], capture_output=True, text=True)
-    if mount_path in mount_check.stdout:
-      print(f"Ramdisk already mounted at {mount_path}")
-      return True
-  except Exception as e:
-    print(colored(f"Error checking mounts: {e}", "red"))
-    return False
-
-  # Mount the ramdisk
-  try:
-    # Size in bytes = MB * 1024 * 1024
-    size_bytes = size_mb * 1024 * 1024
-    result = subprocess.run(
-      ["mount", "-t", "tmpfs", "-o", f"size={size_bytes}", "tmpfs", mount_path],
-      capture_output=True, text=True
-    )
-
-    if result.returncode != 0:
-      print(colored(f"Error mounting ramdisk: {result.stderr}", "red"))
-      return False
-
-    print(colored(f"Successfully mounted {size_mb}MB ramdisk at {mount_path}", "green"))
-    return True
-  except Exception as e:
-    print(colored(f"Error mounting ramdisk: {e}", "red"))
-    return False
 
 
 def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_connections):
@@ -108,9 +54,37 @@ def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_c
   return session.client("s3", endpoint_url=endpoint_url, config=botocore_config)
 
 
+# Define standalone functions for multiprocessing
+def upload_part_worker(args):
+  """Worker function for uploading a part of a file"""
+  bucket_name, object_key, upload_id, part_number, data, endpoint_url, access_key, secret_key, region = args
+
+  # Create a fresh client for this worker
+  s3_client = create_boto3_client(
+    access_key=access_key,
+    secret_key=secret_key,
+    region=region,
+    endpoint_url=endpoint_url,
+    max_pool_connections=20  # Smaller pool for part workers
+  )
+
+  try:
+    response = s3_client.upload_part(
+      Bucket=bucket_name,
+      Key=object_key,
+      PartNumber=part_number,
+      UploadId=upload_id,
+      Body=data
+    )
+    return part_number, response['ETag']
+  except Exception as e:
+    print(f"Error uploading part {part_number} of {object_key}: {e}")
+    raise
+
+
 def download_part_worker(args):
   """Worker function for downloading a part of a file"""
-  bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, persist_downloads = args
+  bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region = args
 
   # Create a fresh client for this worker
   s3_client = create_boto3_client(
@@ -127,21 +101,19 @@ def download_part_worker(args):
       Key=object_key,
       Range=f"bytes={start_byte}-{end_byte}"
     )
-    # Read data
+    # Read data but don't return it to avoid memory issues with large files
     chunk = response['Body'].read()
-    if persist_downloads:
-      return start_byte, chunk  # Return position and data for reassembly
-    else:
-      return len(chunk)  # Just return the size we processed
+    return len(chunk)  # Just return the size we processed
   except Exception as e:
     print(f"Error downloading part of {object_key} ({start_byte}-{end_byte}): {e}")
     raise
 
 
 def process_single_file(args_dict, file_index, timestamp, file_key):
-  """Process a single file download"""
+  """Process a single file (upload or download)"""
   # Extract parameters from the dictionary
   bucket_name = args_dict['bucket_name']
+  mode = args_dict['mode']
   concurrency = args_dict['concurrency']
   multipart_size_mb = args_dict['multipart_size_mb']
   object_size_mb = args_dict['object_size_mb']
@@ -149,11 +121,9 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
   access_key = args_dict['access_key_aws_id']
   secret_key = args_dict['secret_access_key']
   region = args_dict['region_name']
+  filename_suffix = args_dict.get('filename_suffix', '') or ''
   max_pool_connections = args_dict['max_pool_connections']
   prefix = args_dict.get('prefix')
-  persist_downloads = args_dict.get('persist_downloads', False)
-  save_to_ramdisk = args_dict.get('save_to_ramdisk', False)
-  ramdisk_path = args_dict.get('ramdisk_path', '/mnt/ramdisk')
 
   # Create a client for the main operations
   s3_client = create_boto3_client(
@@ -171,8 +141,8 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
   retry_count = 0
   max_retries = 10
 
-  # For download with prefix, get the actual file size
-  if prefix:
+  # For download mode with prefix, get the actual file size
+  if mode == "download" and prefix:
     try:
       # Get the actual file size for existing files with prefix
       head_res = s3_client.head_object(Bucket=bucket_name, Key=file_key)
@@ -184,69 +154,89 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
   else:
     file_display_name = f"file_{file_index}"
 
-  # Prepare output path if saving to ramdisk
-  if save_to_ramdisk:
-    # Create a clean filename based on the file_key
-    safe_filename = os.path.basename(file_key).replace('/', '_')
-    output_path = os.path.join(ramdisk_path, safe_filename)
-  else:
-    output_path = None
-
   # Main processing loop with retries
   while retry_count <= max_retries:
     try:
-      # Get the object size
-      head_res = s3_client.head_object(Bucket=bucket_name, Key=file_key)
-      content_length = int(head_res['ContentLength'])
+      if mode == "upload":
+        # Generate random data for upload
+        data = np.random.bytes(object_size_mb * 1024 * 1024)
 
-      # Calculate parts for download
-      download_parts = []
-      position = 0
+        # Create a unique object key
+        object_key = f"{filename_suffix}my_upload_{file_index}_{timestamp}"
 
-      while position < content_length:
-        end_position = min(position + multipart_size - 1, content_length - 1)
+        # Start a multipart upload
+        multipart_upload = s3_client.create_multipart_upload(
+          Bucket=bucket_name,
+          Key=object_key
+        )
+        upload_id = multipart_upload['UploadId']
 
-        download_parts.append((
-          bucket_name,
-          file_key,
-          position,
-          end_position,
-          endpoint_url,
-          access_key,
-          secret_key,
-          region,
-          persist_downloads or save_to_ramdisk  # Need to keep data if we're saving to disk
-        ))
+        # Prepare the parts for upload
+        upload_parts = []
+        part_number = 1
+        position = 0
 
-        position = end_position + 1
+        while position < len(data):
+          end_position = min(position + multipart_size, len(data))
+          part_data = data[position:end_position]
 
-      # Download parts in parallel
-      with multiprocessing.Pool(processes=concurrency) as pool:
-        results = pool.map(download_part_worker, download_parts)
+          upload_parts.append((
+            bucket_name,
+            object_key,
+            upload_id,
+            part_number,
+            part_data,
+            endpoint_url,
+            access_key,
+            secret_key,
+            region
+          ))
 
-      # If persisting downloads or saving to ramdisk, reassemble the file
-      if persist_downloads or save_to_ramdisk:
-        # Sort results by start position
-        sorted_results = sorted(results, key=lambda x: x[0])
+          position = end_position
+          part_number += 1
 
-        # Concatenate all parts
-        complete_file = b''.join([chunk for _, chunk in sorted_results])
+        # Upload parts in parallel
+        with multiprocessing.Pool(processes=concurrency) as pool:
+          results = pool.map(upload_part_worker, upload_parts)
 
-        # Validate the file size
-        if len(complete_file) != content_length:
-          raise ValueError(
-            f"Downloaded file size ({len(complete_file)}) does not match expected size ({content_length})")
+        # Complete the multipart upload
+        s3_client.complete_multipart_upload(
+          Bucket=bucket_name,
+          Key=object_key,
+          UploadId=upload_id,
+          MultipartUpload={
+            'Parts': [{'PartNumber': part_num, 'ETag': etag} for part_num, etag in results]
+          }
+        )
 
-        # Save to ramdisk if requested
-        if save_to_ramdisk and output_path:
-          try:
-            with open(output_path, 'wb') as f:
-              f.write(complete_file)
-            print(f"Saved {file_display_name} to {output_path}")
-          except Exception as e:
-            print(colored(f"Error saving file to ramdisk: {e}", "red"))
+      elif mode == "download":
+        # Get the object size
+        head_res = s3_client.head_object(Bucket=bucket_name, Key=file_key)
+        content_length = int(head_res['ContentLength'])
 
-        print(f"Successfully downloaded and validated {file_display_name}, size: {len(complete_file)} bytes")
+        # Calculate parts for download
+        download_parts = []
+        position = 0
+
+        while position < content_length:
+          end_position = min(position + multipart_size - 1, content_length - 1)
+
+          download_parts.append((
+            bucket_name,
+            file_key,
+            position,
+            end_position,
+            endpoint_url,
+            access_key,
+            secret_key,
+            region
+          ))
+
+          position = end_position + 1
+
+        # Download parts in parallel
+        with multiprocessing.Pool(processes=concurrency) as pool:
+          pool.map(download_part_worker, download_parts)
 
       # If we get here, the operation was successful
       break
@@ -304,33 +294,6 @@ def upload_test_file(bucket_name, object_key, object_size_mb, concurrency, multi
   part_number = 1
   position = 0
 
-  # Helper function for part upload
-  def upload_part_worker(args):
-    """Worker function for uploading a part of a file"""
-    bucket_name, object_key, upload_id, part_number, data, endpoint_url, access_key, secret_key, region = args
-
-    # Create a fresh client for this worker
-    s3_client = create_boto3_client(
-      access_key=access_key,
-      secret_key=secret_key,
-      region=region,
-      endpoint_url=endpoint_url,
-      max_pool_connections=20  # Smaller pool for part workers
-    )
-
-    try:
-      response = s3_client.upload_part(
-        Bucket=bucket_name,
-        Key=object_key,
-        PartNumber=part_number,
-        UploadId=upload_id,
-        Body=data
-      )
-      return part_number, response['ETag']
-    except Exception as e:
-      print(f"Error uploading part {part_number} of {object_key}: {e}")
-      raise
-
   while position < len(data):
     end_position = min(position + multipart_size, len(data))
     part_data = data[position:end_position]
@@ -368,40 +331,9 @@ def upload_test_file(bucket_name, object_key, object_size_mb, concurrency, multi
   return object_key
 
 
-def delete_previous_files(bucket_name, prefix, s3_client):
-  """Delete all files with the given prefix from the bucket"""
-  if not prefix:
-    print("Warning: No prefix specified for deletion. Skipping...")
-    return
-
-  print(f"Listing files with prefix '{prefix}' for deletion...")
-  paginator = s3_client.get_paginator('list_objects_v2')
-  pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
-
-  delete_count = 0
-  for page in pages:
-    if 'Contents' in page:
-      for obj in page['Contents']:
-        key = obj['Key']
-        try:
-          s3_client.delete_object(Bucket=bucket_name, Key=key)
-          delete_count += 1
-        except Exception as e:
-          print(f"Error deleting {key}: {e}")
-
-  print(f"Deleted {delete_count} files with prefix '{prefix}'")
-
-
 def main():
   # Parse command line arguments
   args = parse_args()
-
-  # Set up ramdisk if requested
-  if args.save_to_ramdisk:
-    ramdisk_success = create_ramdisk(args.ramdisk_size_mb, args.ramdisk_path)
-    if not ramdisk_success:
-      print(colored("Warning: Failed to create ramdisk. Files will not be saved to disk.", "yellow"))
-      args.save_to_ramdisk = False
 
   # Initialize S3 client for the main process
   s3_client = create_boto3_client(
@@ -417,21 +349,13 @@ def main():
   if filename_suffix and filename_suffix[-1] != "_":
     filename_suffix += "_"
 
-  # Delete previous files if requested
-  if args.delete_previous:
-    delete_prefix = args.prefix if args.prefix else filename_suffix
-    if delete_prefix:
-      delete_previous_files(args.bucket_name, delete_prefix, s3_client)
-    else:
-      print("Warning: Cannot delete previous files without a prefix or filename suffix")
-
   # Current timestamp for filenames
   timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
   start_time = datetime.now()
 
-  # Get files to download from bucket
+  # For download mode with prefix, get files to download from bucket
   file_keys = []
-  if args.prefix:
+  if args.mode == "download" and args.prefix:
     print(f"Listing files with prefix '{args.prefix}' from bucket {args.bucket_name}...")
     paginator = s3_client.get_paginator('list_objects_v2')
     pages = paginator.paginate(Bucket=args.bucket_name, Prefix=args.prefix)
@@ -454,8 +378,10 @@ def main():
       # Adjust iteration_number to match number of files found
       args.iteration_number = len(file_keys)
       print(f"Adjusting iteration_number to {args.iteration_number} to match files found")
-  else:
-    # For download benchmark without prefix, upload the file first and use it as the source
+
+  # For download benchmark without prefix, upload the file first and use it as the source
+  source_filename = None
+  if args.mode == "download" and not args.prefix:
     print("Preparing source file for download testing...")
     source_filename = f"{filename_suffix}download_source_{timestamp}"
     upload_test_file(
@@ -469,8 +395,6 @@ def main():
       secret_key=args.secret_access_key,
       region=args.region_name
     )
-    # Use the uploaded file for all download iterations
-    file_keys = [source_filename] * args.iteration_number
 
   # Set up process-based parallelism for file operations
   # Use the number of CPUs as guidance but don't exceed the requested file_parallelism
@@ -487,15 +411,28 @@ def main():
     futures = []
 
     # Submit all file processing tasks
-    for i, file_key in enumerate(file_keys):
-      future = executor.submit(
-        process_single_file,
-        args_dict,
-        i,
-        timestamp,
-        file_key  # Use the actual file key
-      )
-      futures.append(future)
+    if args.mode == "download" and args.prefix:
+      # Submit tasks for downloading existing files with prefix
+      for i, file_key in enumerate(file_keys):
+        future = executor.submit(
+          process_single_file,
+          args_dict,
+          i,
+          timestamp,
+          file_key  # Use the actual file key
+        )
+        futures.append(future)
+    else:
+      # Standard behavior for upload or download without prefix
+      for i in range(args.iteration_number):
+        future = executor.submit(
+          process_single_file,
+          args_dict,
+          i,
+          timestamp,
+          source_filename
+        )
+        futures.append(future)
 
     # Collect results as they complete
     for future in concurrent.futures.as_completed(futures):
@@ -526,13 +463,10 @@ def main():
       "actual_file_parallelism": max_workers,
       "concurrency_per_file": args.concurrency,
       "max_pool_connections": args.max_pool_connections,
-      "save_to_ramdisk": args.save_to_ramdisk,
-      "ramdisk_path": args.ramdisk_path if args.save_to_ramdisk else None,
-      "ramdisk_size_mb": args.ramdisk_size_mb if args.save_to_ramdisk else None,
     }
 
     summary = {
-      "mode": "download",
+      "mode": args.mode,
       "object_size_mb": args.object_size_mb,
       "num_iterations": args.iteration_number,
       "throughput_percentile": {
@@ -549,8 +483,6 @@ def main():
       "start_time": start_time.isoformat(),
       "end_time": end_time.isoformat(),
       "total_duration_seconds": (end_time - start_time).total_seconds(),
-      "persist_downloads": args.persist_downloads,
-      "delete_previous": args.delete_previous,
     }
 
     print("\nJSON Summary:")
