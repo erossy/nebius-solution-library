@@ -8,23 +8,12 @@ import os
 import sys
 import tempfile
 import fcntl
-import io
-from contextlib import closing
 
 import boto3
 import boto3.s3.transfer
 import botocore.config
 import numpy as np
 from termcolor import colored
-
-try:
-  # Optional imports for better performance
-  import psutil
-  import asyncio
-
-  HAS_ASYNCIO = True
-except ImportError:
-  HAS_ASYNCIO = False
 
 
 def parse_args():
@@ -45,10 +34,6 @@ def parse_args():
   parser.add_argument("--save-to-disk", help="Path where to save downloaded files", type=str, default=None)
   parser.add_argument("--streaming-mode", help="Use direct streaming to disk", action="store_true", default=True)
   parser.add_argument("--skip-validation", help="Skip post-download validation", action="store_true", default=False)
-  parser.add_argument("--io-threads", help="Number of I/O threads per worker", type=int, default=8)
-  parser.add_argument("--chunk-size-kb", help="Chunk size in KB for streaming", type=int, default=1024)
-  parser.add_argument("--auto-optimize", help="Automatically optimize parameters for CPU", action="store_true",
-                      default=True)
 
   args = parser.parse_args()
 
@@ -70,40 +55,19 @@ def ensure_directory_exists(directory_path):
 
 
 def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_connections):
-  """Create a boto3 S3 client with optimized settings for high-throughput transfers"""
+  """Create a boto3 S3 client with the given credentials"""
   session = boto3.session.Session(
     aws_access_key_id=access_key,
     aws_secret_access_key=secret_key,
     region_name=region,
   )
 
-  # Enhanced configuration for better performance
   botocore_config = botocore.config.Config(
     max_pool_connections=max_pool_connections,
-    retries={'max_attempts': 10, 'mode': 'adaptive'},
-    connect_timeout=10,  # Longer connection timeout
-    read_timeout=30,  # Longer read timeout
-    tcp_keepalive=True,  # Keep connections alive
-    use_dualstack_endpoint=False,  # Disable dual stack for better performance if not needed
+    retries={'max_attempts': 10, 'mode': 'adaptive'}
   )
 
-  # Create the client with optimized settings
-  client = session.client("s3", endpoint_url=endpoint_url, config=botocore_config)
-
-  # Set socket options for client if psutil is available
-  try:
-    import socket
-    # Attempt to set aggressive TCP settings on the boto3 internal HTTP client
-    for http_client in client._endpoint.http_session._manager.connection_pool_kw.get('connections', []):
-      sock = getattr(http_client, 'sock', None)
-      if sock:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # Disable Nagle's algorithm
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)  # Enable keepalive
-  except (ImportError, AttributeError, TypeError) as e:
-    # Not critical if it fails
-    pass
-
-  return client
+  return session.client("s3", endpoint_url=endpoint_url, config=botocore_config)
 
 
 def download_part_to_memory(args):
@@ -134,79 +98,48 @@ def download_part_to_memory(args):
 
 
 def download_part_to_file(args):
-  """Worker function for downloading a part of a file directly to disk using multiple I/O threads"""
-  bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, output_file, io_threads, chunk_size_kb = args
+  """Worker function for downloading a part of a file directly to disk"""
+  bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, output_file = args
 
-  # Create a fresh client for this worker with optimized settings
+  # Create a fresh client for this worker
   s3_client = create_boto3_client(
     access_key=access_key,
     secret_key=secret_key,
     region=region,
     endpoint_url=endpoint_url,
-    max_pool_connections=io_threads * 2  # More connections per worker
+    max_pool_connections=20  # Smaller pool for part workers
   )
 
   try:
-    # Calculate chunk boundaries for parallel I/O within this part
-    total_bytes = end_byte - start_byte + 1
-    bytes_per_io_thread = total_bytes // io_threads
+    response = s3_client.get_object(
+      Bucket=bucket_name,
+      Key=object_key,
+      Range=f"bytes={start_byte}-{end_byte}"
+    )
 
-    if bytes_per_io_thread <= 0:
-      # If the part is too small for multiple threads, use a single thread
-      io_threads = 1
-      bytes_per_io_thread = total_bytes
+    # Read data in chunks to minimize memory usage
+    body = response['Body']
+    bytes_written = 0
 
-    # Function for each I/O thread to handle a sub-range
-    def download_and_write_subrange(thread_idx):
-      thread_start = start_byte + (thread_idx * bytes_per_io_thread)
-      thread_end = min(thread_start + bytes_per_io_thread - 1, end_byte)
-
-      if thread_idx == io_threads - 1:  # Make sure the last thread gets all remaining bytes
-        thread_end = end_byte
-
+    # Open the file and acquire an exclusive lock for this process
+    with open(output_file, 'r+b') as f:
+      fcntl.flock(f, fcntl.LOCK_EX)  # Exclusive lock
       try:
-        # Download this thread's sub-range
-        thread_response = s3_client.get_object(
-          Bucket=bucket_name,
-          Key=object_key,
-          Range=f"bytes={thread_start}-{thread_end}"
-        )
+        # Seek to the correct position
+        f.seek(start_byte)
 
-        # Read data in optimized chunks
-        thread_body = thread_response['Body']
-        thread_bytes_written = 0
-        chunk_size = chunk_size_kb * 1024  # Convert KB to bytes
+        # Stream data from S3 to file in chunks
+        chunk_size = 8 * 1024 * 1024  # 8MB chunks
+        while True:
+          chunk = body.read(chunk_size)
+          if not chunk:
+            break
+          f.write(chunk)
+          bytes_written += len(chunk)
+      finally:
+        fcntl.flock(f, fcntl.LOCK_UN)  # Release lock
 
-        # Open the file and acquire an exclusive lock for this process
-        with open(output_file, 'r+b') as f:
-          fcntl.flock(f, fcntl.LOCK_EX)  # Exclusive lock
-          try:
-            # Seek to the correct position for this thread
-            f.seek(thread_start)
-
-            # Use buffered I/O for better performance
-            buf = bytearray(chunk_size)
-            bytes_read = thread_body.read(chunk_size)
-            while bytes_read:
-              f.write(bytes_read)
-              thread_bytes_written += len(bytes_read)
-              bytes_read = thread_body.read(chunk_size)
-          finally:
-            fcntl.flock(f, fcntl.LOCK_UN)  # Release lock
-
-        return thread_bytes_written
-      except Exception as e:
-        print(f"Error in I/O thread {thread_idx} downloading part of {object_key} ({thread_start}-{thread_end}): {e}")
-        raise
-
-    # Create and start I/O threads
-    with concurrent.futures.ThreadPoolExecutor(max_workers=io_threads) as executor:
-      futures = [executor.submit(download_and_write_subrange, i) for i in range(io_threads)]
-      results = [future.result() for future in concurrent.futures.as_completed(futures)]
-
-    total_bytes_written = sum(results)
-    return total_bytes_written
-
+    return bytes_written
   except Exception as e:
     print(f"Error downloading part of {object_key} ({start_byte}-{end_byte}): {e}")
     raise
@@ -227,9 +160,6 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
   prefix = args_dict.get('prefix')
   save_to_disk = args_dict.get('save_to_disk')
   streaming_mode = args_dict.get('streaming_mode', True)
-  io_threads = args_dict.get('io_threads', 8)
-  chunk_size_kb = args_dict.get('chunk_size_kb', 1024)
-  auto_optimize = args_dict.get('auto_optimize', True)
 
   # Create a client for the main operations
   s3_client = create_boto3_client(
@@ -327,9 +257,7 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
             access_key,
             secret_key,
             region,
-            output_path,
-            io_threads,
-            chunk_size_kb
+            output_path
           ))
 
           position = end_position + 1
@@ -536,82 +464,9 @@ def upload_test_file(bucket_name, object_key, object_size_mb, concurrency, multi
   return object_key
 
 
-def auto_optimize_parameters(args):
-  """Automatically optimize parameters based on CPU count and system info"""
-  import psutil
-
-  # Get system information
-  cpu_count = os.cpu_count()
-  memory_info = psutil.virtual_memory()
-  total_memory_gb = memory_info.total / (1024 ** 3)
-  disk_io = psutil.disk_io_counters()
-
-  print(f"Detected {cpu_count} CPU cores and {total_memory_gb:.1f} GB memory")
-
-  # Optimize file parallelism based on CPU count
-  if args.auto_optimize:
-    # Set file_parallelism to use 75% of available cores
-    optimal_file_parallelism = max(1, int(cpu_count * 0.75))
-    if args.file_parallelism != optimal_file_parallelism:
-      print(f"Auto-optimizing: Changing file_parallelism from {args.file_parallelism} to {optimal_file_parallelism}")
-      args.file_parallelism = optimal_file_parallelism
-
-    # Calculate optimal part concurrency
-    # Aim to keep total threads at 4x CPU count for optimal IO-bound performance
-    total_desired_threads = cpu_count * 4
-    threads_per_file = max(2, total_desired_threads // args.file_parallelism)
-    if args.concurrency != threads_per_file:
-      print(f"Auto-optimizing: Changing concurrency from {args.concurrency} to {threads_per_file}")
-      args.concurrency = threads_per_file
-
-    # Set io_threads based on remaining CPU capacity
-    # We want to fully saturate the CPU without oversubscribing too much
-    optimal_io_threads = max(2, cpu_count // args.file_parallelism)
-    if args.io_threads != optimal_io_threads:
-      print(f"Auto-optimizing: Changing io_threads from {args.io_threads} to {optimal_io_threads}")
-      args.io_threads = optimal_io_threads
-
-    # Set optimal connection pools
-    optimal_connections = args.file_parallelism * args.concurrency * 2
-    if args.max_pool_connections != optimal_connections:
-      print(f"Auto-optimizing: Changing max_pool_connections from {args.max_pool_connections} to {optimal_connections}")
-      args.max_pool_connections = optimal_connections
-
-    # Adjust chunk size based on memory
-    # For systems with more memory, larger chunks improve throughput
-    if total_memory_gb > 16:
-      optimal_chunk_size = 4096  # 4MB for high-memory systems
-    elif total_memory_gb > 8:
-      optimal_chunk_size = 2048  # 2MB for medium-memory systems
-    else:
-      optimal_chunk_size = 1024  # 1MB for low-memory systems
-
-    if args.chunk_size_kb != optimal_chunk_size:
-      print(f"Auto-optimizing: Changing chunk_size_kb from {args.chunk_size_kb} to {optimal_chunk_size}")
-      args.chunk_size_kb = optimal_chunk_size
-
-  return args
-
-
 def main():
   # Parse command line arguments
   args = parse_args()
-
-  try:
-    # Try to import psutil for better auto-optimization
-    import psutil
-    # Auto-optimize parameters based on system capabilities
-    if args.auto_optimize:
-      args = auto_optimize_parameters(args)
-  except ImportError:
-    print("Warning: psutil not available. Auto-optimization will be limited.")
-    # Basic optimization without psutil
-    if args.auto_optimize:
-      cpu_count = os.cpu_count()
-      args.file_parallelism = max(1, int(cpu_count * 0.75))
-      args.concurrency = max(2, (cpu_count * 4) // args.file_parallelism)
-      args.io_threads = max(2, cpu_count // args.file_parallelism)
-      args.max_pool_connections = args.file_parallelism * args.concurrency * 2
 
   # Make sure save directory exists if specified
   if args.save_to_disk:
