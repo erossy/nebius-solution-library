@@ -172,8 +172,6 @@ Network utilization was measured using the `bmon` tool. To reproduce similar mea
    ```
    Replace `interface_name` with your actual network interface (e.g., eth0, ens5, etc.)
 
-This command provides real-time monitoring with 1-second refresh intervals and outputs timestamp, RX, and TX rates in bytes.
-
 
 ## Output
 
