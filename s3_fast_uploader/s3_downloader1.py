@@ -559,9 +559,9 @@ def auto_optimize_parameters(args):
     max_pool_connections=args.max_pool_connections
   )
 
-  # Determine the number of files to download
+  # Determine the number of files to download and collect file sizes
   num_files = args.iteration_number
-  total_volume_mb = 0
+  file_sizes_mb = []
 
   if args.prefix:
     # Count actual files with prefix
@@ -577,22 +577,31 @@ def auto_optimize_parameters(args):
           try:
             head_res = s3_client.head_object(Bucket=args.bucket_name, Key=obj['Key'])
             file_size_mb = int(head_res['ContentLength']) / (1024 * 1024)
-            total_volume_mb += file_size_mb
+            file_sizes_mb.append(file_size_mb)
           except Exception as e:
             print(f"Warning: Failed to get size for {obj['Key']}: {e}")
             # Use provided object size as fallback
-            total_volume_mb += args.object_size_mb
+            file_sizes_mb.append(args.object_size_mb)
 
     num_files = len(file_keys)
     if num_files == 0:
       print("No files found with prefix. Using default iteration number.")
       num_files = args.iteration_number
-      total_volume_mb = args.object_size_mb * num_files
+      file_sizes_mb = [args.object_size_mb] * num_files
   else:
     # For benchmark mode, use the specified parameters
-    total_volume_mb = args.object_size_mb * args.iteration_number
+    file_sizes_mb = [args.object_size_mb] * args.iteration_number
 
-  print(f"Files to download: {num_files}, Total volume: {total_volume_mb:.2f} MB")
+  # Calculate median file size
+  if file_sizes_mb:
+    median_object_size_mb = sorted(file_sizes_mb)[len(file_sizes_mb) // 2]
+    total_volume_mb = sum(file_sizes_mb)
+  else:
+    median_object_size_mb = args.object_size_mb
+    total_volume_mb = args.object_size_mb * num_files
+
+  print(
+    f"Files to download: {num_files}, Total volume: {total_volume_mb:.2f} MB, Median size: {median_object_size_mb:.2f} MB")
 
   # Apply the new auto-optimize logic
   # 1. file-parallelism = smallest of amount of files to download vs 0.75*cpu_cores
@@ -606,10 +615,10 @@ def auto_optimize_parameters(args):
     optimal_concurrency = min(16, num_files)
   optimal_concurrency = max(1, optimal_concurrency)  # Ensure at least 1
 
-  # 3. multipart-size-mb = total volume to download / (file-parallelism * concurrency)
+  # 3. multipart-size-mb = median object size / concurrency
   # Ensure we don't get too small parts
-  if total_volume_mb > 0 and optimal_file_parallelism > 0 and optimal_concurrency > 0:
-    optimal_multipart_size = total_volume_mb / (optimal_file_parallelism * optimal_concurrency)
+  if median_object_size_mb > 0 and optimal_concurrency > 0:
+    optimal_multipart_size = median_object_size_mb / optimal_concurrency
     # Ensure minimum part size is at least 5MB (S3 minimum) and round to nearest MB
     optimal_multipart_size = max(5, round(optimal_multipart_size))
   else:
