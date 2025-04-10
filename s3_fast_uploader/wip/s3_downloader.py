@@ -64,7 +64,7 @@ def create_ramdisk(size_mb, mount_path):
 
   # Check if it's already mounted as tmpfs
   try:
-    mount_check = subprocess.run(["mount", "-t", "tmpfs"], capture_output=True, text=True)
+    mount_check = subprocess.run(["sudo", "mount", "-t", "tmpfs"], capture_output=True, text=True)
     if mount_path in mount_check.stdout:
       print(f"Ramdisk already mounted at {mount_path}")
       return True
