@@ -178,13 +178,6 @@ def download_file_parts(args_dict, file_index, file_key):
       with multiprocessing.Pool(processes=concurrency) as pool:
         results = pool.map(download_part_worker, download_parts)
 
-      # Important: We assemble the file in memory here regardless of save_to_disk
-      # Sort results by part index to ensure correct order
-      sorted_results = sorted(results, key=lambda x: x[1])
-
-      # Concatenate all parts - this is done in memory for both modes
-      complete_file = b''.join([chunk for _, _, _, chunk in sorted_results])
-
       # Calculate throughput
       operation_end = time.time()
       duration = operation_end - operation_start
@@ -195,7 +188,7 @@ def download_file_parts(args_dict, file_index, file_key):
         "green"
       ))
 
-      # Return information for later processing
+      # Return information for later processing - including all parts for assembly later
       return {
         'file_key': file_key,
         'file_index': file_index,
@@ -203,7 +196,7 @@ def download_file_parts(args_dict, file_index, file_key):
         'download_success': True,
         'content_length': content_length,
         'output_path': output_path,
-        'assembled_file': complete_file,  # Return the assembled file directly
+        'parts': results,  # Return the raw parts for later assembly
         'throughput_mb': throughput_mb,
         'save_to_disk': save_to_disk is not None
       }
@@ -227,12 +220,15 @@ def download_file_parts(args_dict, file_index, file_key):
       time.sleep(1)  # Wait before retrying
 
 
-def save_files_to_disk(download_results):
-  """Save all successfully downloaded and assembled files to disk"""
+def save_files_to_disk(assembled_results):
+  """Save all successfully assembled files to disk"""
   print("\nSaving files to disk...")
 
-  # Filter for successful downloads that need to be saved
-  save_tasks = [result for result in download_results if result['download_success'] and result['save_to_disk']]
+  # Filter for successful assemblies that need to be saved
+  save_tasks = [result for result in assembled_results if
+                result['download_success'] and
+                result.get('assembly_success', False) and
+                result['save_to_disk']]
 
   save_results = []
 
@@ -487,8 +483,8 @@ def main():
   # Convert args to dictionary for pickling
   args_dict = vars(args)
 
-  # ==== OPTIMIZED APPROACH: DOWNLOAD & ASSEMBLE EVERYTHING FIRST, THEN SAVE TO DISK IF NEEDED ====
-  print("\n===== PHASE 1: DOWNLOADING AND ASSEMBLING ALL FILES IN MEMORY =====")
+  # ==== SEQUENTIALIZED APPROACH: DOWNLOAD FIRST, THEN ASSEMBLE, THEN SAVE TO DISK IF NEEDED ====
+  print("\n===== PHASE 1: DOWNLOADING ALL FILE PARTS =====")
   download_start = datetime.now()
 
   # Use ProcessPoolExecutor to handle multiple files in parallel
@@ -517,15 +513,56 @@ def main():
 
   download_end = datetime.now()
   download_duration = (download_end - download_start).total_seconds()
-  print(f"\nDownload and assembly phase completed in {download_duration:.2f} seconds")
+  print(f"\nDownload phase completed in {download_duration:.2f} seconds")
+
+  # Assembly phase
+  print("\n===== PHASE 2: ASSEMBLING FILES IN MEMORY =====")
+  assembly_start = datetime.now()
+
+  # Assembly function
+  def assemble_file(file_info):
+    if not file_info['download_success']:
+      return file_info
+
+    try:
+      # Get all parts for this file
+      parts = file_info['parts']
+
+      # Sort results by part index to ensure correct order
+      sorted_parts = sorted(parts, key=lambda x: x[1])
+
+      # Concatenate all parts
+      complete_file = b''.join([chunk for _, _, _, chunk in sorted_parts])
+
+      # Add assembled file to the result
+      file_info['assembled_file'] = complete_file
+      file_info['assembly_success'] = True
+
+      print(colored(f"Assembled {file_info['file_display_name']} ({len(complete_file)} bytes)", "green"))
+      return file_info
+    except Exception as e:
+      print(colored(f"Error assembling {file_info['file_display_name']}: {e}", "red"))
+      file_info['assembly_success'] = False
+      file_info['assembly_error'] = str(e)
+      return file_info
+
+  # Process assembly for each file
+  assembled_results = []
+  for file_info in download_results:
+    assembled_result = assemble_file(file_info)
+    assembled_results.append(assembled_result)
+
+  assembly_end = datetime.now()
+  assembly_duration = (assembly_end - assembly_start).total_seconds()
+  print(f"\nAssembly phase completed in {assembly_duration:.2f} seconds")
 
   # Save phase - only if needed
   if args.save_to_disk:
-    print("\n===== PHASE 2: SAVING FILES TO DISK =====")
+    print("\n===== PHASE 3: SAVING FILES TO DISK =====")
     save_start = datetime.now()
 
     # Save all files
-    save_results = save_files_to_disk(download_results)
+    save_results = save_files_to_disk(assembled_results)
 
     save_end = datetime.now()
     save_duration = (save_end - save_start).total_seconds()
@@ -534,7 +571,7 @@ def main():
     # Validate saved files
     validation_results = validate_downloaded_files(save_results, args)
   else:
-    validation_results = download_results
+    validation_results = assembled_results
 
   end_time = datetime.now()
 
@@ -564,7 +601,7 @@ def main():
       "mode": "download",
       "object_size_mb": args.object_size_mb,
       "num_iterations": args.iteration_number,
-      "assembly_mode": "optimized-in-memory",  # Always using optimized mode now
+      "assembly_mode": "sequentialized",  # Using fully sequentialized phases
       "throughput_percentile": {
         "p0": float(f"{percentiles[0]:.2f}"),
         "p5": float(f"{percentiles[1]:.2f}"),
@@ -581,6 +618,9 @@ def main():
       "phases": {
         "download": {
           "duration_seconds": download_duration
+        },
+        "assembly": {
+          "duration_seconds": assembly_duration
         },
         "save": {
           "duration_seconds": save_duration if args.save_to_disk else 0
@@ -604,8 +644,9 @@ def main():
     print(f"Total Duration: {(end_time - start_time).total_seconds():.2f} seconds")
 
     if args.save_to_disk:
-      print(f"Assembly Mode: optimized-in-memory")
+      print(f"Assembly Mode: sequentialized")
       print(f"  - Download phase: {download_duration:.2f} seconds")
+      print(f"  - Assembly phase: {assembly_duration:.2f} seconds")
       print(f"  - Save phase: {save_duration:.2f} seconds")
   else:
     print("No successful downloads to report.")
