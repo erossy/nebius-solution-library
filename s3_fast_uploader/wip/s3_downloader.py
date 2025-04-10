@@ -77,7 +77,7 @@ def create_ramdisk(size_mb, mount_path):
     # Size in bytes = MB * 1024 * 1024
     size_bytes = size_mb * 1024 * 1024
     result = subprocess.run(
-      ["mount", "-t", "tmpfs", "-o", f"size={size_bytes}", "tmpfs", mount_path],
+      ["sudo", "mount", "-t", "tmpfs", "-o", f"size={size_bytes}", "tmpfs", mount_path],
       capture_output=True, text=True
     )
 
