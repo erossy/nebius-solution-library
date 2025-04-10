@@ -5,9 +5,7 @@ import time
 import concurrent.futures
 from datetime import datetime
 import os
-import subprocess
 import sys
-import tempfile
 
 import boto3
 import boto3.s3.transfer
@@ -24,7 +22,6 @@ def parse_args():
   parser.add_argument("--region-name", help="Region Name", default="eu-north1")
   parser.add_argument("--endpoint-url", help="Endpoint URL", required=True)
   parser.add_argument("--bucket-name", help="Bucket Name", required=True)
-  parser.add_argument("--filename-suffix", help="Filename suffix (can be without _ in the end)", required=False)
   parser.add_argument("--iteration-number", help="Iteration Number", type=int, required=True)
   parser.add_argument("--object-size-mb", help="Object Size in MB", type=int, required=True)
   parser.add_argument("--concurrency", help="Concurrency per file", type=int, required=True)
@@ -32,12 +29,7 @@ def parse_args():
   parser.add_argument("--file-parallelism", help="Number of files to download in parallel", type=int, default=4)
   parser.add_argument("--max-pool-connections", help="Max boto3 connection pool size", type=int, default=100)
   parser.add_argument("--prefix", help="Only download files with this prefix", type=str, default=None)
-  parser.add_argument("--persist-downloads", help="Keep downloaded files in memory for validation", action="store_true")
-  parser.add_argument("--delete-previous", help="Delete previous files with the same prefix before starting",
-                      action="store_true")
-  parser.add_argument("--save-to-ramdisk", help="Save downloaded files to a ramdisk", action="store_true")
-  parser.add_argument("--ramdisk-size-mb", help="Size of ramdisk in MB", type=int, default=1024)
-  parser.add_argument("--ramdisk-path", help="Mount point for ramdisk", type=str, default="/mnt/ramdisk")
+  parser.add_argument("--save-to-disk", help="Path where to save downloaded files", type=str, default=None)
 
   args = parser.parse_args()
 
@@ -45,51 +37,17 @@ def parse_args():
   return args
 
 
-def create_ramdisk(size_mb, mount_path):
-  """Create a ramdisk of specified size at the given mount path if it doesn't exist already"""
-  # Check if we're root, required for ramdisk operations
-  if os.geteuid() != 0:
-    print(colored("Error: Root privileges required to create ramdisk. Please run with sudo.", "red"))
-    print(colored("Continuing without ramdisk...", "yellow"))
-    return False
-
-  # Create mount point if it doesn't exist
-  if not os.path.exists(mount_path):
+def ensure_directory_exists(directory_path):
+  """Ensure that the specified directory exists, creating it if necessary"""
+  if not os.path.exists(directory_path):
     try:
-      os.makedirs(mount_path, exist_ok=True)
-      print(f"Created mount point at {mount_path}")
-    except Exception as e:
-      print(colored(f"Error creating mount point: {e}", "red"))
-      return False
-
-  # Check if it's already mounted as tmpfs
-  try:
-    mount_check = subprocess.run(["sudo", "mount", "-t", "tmpfs"], capture_output=True, text=True)
-    if mount_path in mount_check.stdout:
-      print(f"Ramdisk already mounted at {mount_path}")
+      os.makedirs(directory_path, exist_ok=True)
+      print(f"Created directory at {directory_path}")
       return True
-  except Exception as e:
-    print(colored(f"Error checking mounts: {e}", "red"))
-    return False
-
-  # Mount the ramdisk
-  try:
-    # Size in bytes = MB * 1024 * 1024
-    size_bytes = size_mb * 1024 * 1024
-    result = subprocess.run(
-      ["sudo", "mount", "-t", "tmpfs", "-o", f"size={size_bytes}", "tmpfs", mount_path],
-      capture_output=True, text=True
-    )
-
-    if result.returncode != 0:
-      print(colored(f"Error mounting ramdisk: {result.stderr}", "red"))
+    except Exception as e:
+      print(colored(f"Error creating directory: {e}", "red"))
       return False
-
-    print(colored(f"Successfully mounted {size_mb}MB ramdisk at {mount_path}", "green"))
-    return True
-  except Exception as e:
-    print(colored(f"Error mounting ramdisk: {e}", "red"))
-    return False
+  return True
 
 
 def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_connections):
@@ -110,7 +68,7 @@ def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_c
 
 def download_part_worker(args):
   """Worker function for downloading a part of a file"""
-  bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, persist_downloads = args
+  bucket_name, object_key, start_byte, end_byte, endpoint_url, access_key, secret_key, region, save_to_disk = args
 
   # Create a fresh client for this worker
   s3_client = create_boto3_client(
@@ -129,7 +87,7 @@ def download_part_worker(args):
     )
     # Read data
     chunk = response['Body'].read()
-    if persist_downloads:
+    if save_to_disk:
       return start_byte, chunk  # Return position and data for reassembly
     else:
       return len(chunk)  # Just return the size we processed
@@ -151,9 +109,7 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
   region = args_dict['region_name']
   max_pool_connections = args_dict['max_pool_connections']
   prefix = args_dict.get('prefix')
-  persist_downloads = args_dict.get('persist_downloads', False)
-  save_to_ramdisk = args_dict.get('save_to_ramdisk', False)
-  ramdisk_path = args_dict.get('ramdisk_path', '/mnt/ramdisk')
+  save_to_disk = args_dict.get('save_to_disk', None)
 
   # Create a client for the main operations
   s3_client = create_boto3_client(
@@ -184,11 +140,12 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
   else:
     file_display_name = f"file_{file_index}"
 
-  # Prepare output path if saving to ramdisk
-  if save_to_ramdisk:
+  # Prepare output path if saving to disk
+  save_to_disk = args_dict.get('save_to_disk')
+  if save_to_disk:
     # Create a clean filename based on the file_key
     safe_filename = os.path.basename(file_key).replace('/', '_')
-    output_path = os.path.join(ramdisk_path, safe_filename)
+    output_path = os.path.join(save_to_disk, safe_filename)
   else:
     output_path = None
 
@@ -215,7 +172,7 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
           access_key,
           secret_key,
           region,
-          persist_downloads or save_to_ramdisk  # Need to keep data if we're saving to disk
+          save_to_disk is not None  # Need to keep data if we're saving to disk
         ))
 
         position = end_position + 1
@@ -224,8 +181,8 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
       with multiprocessing.Pool(processes=concurrency) as pool:
         results = pool.map(download_part_worker, download_parts)
 
-      # If persisting downloads or saving to ramdisk, reassemble the file
-      if persist_downloads or save_to_ramdisk:
+      # If saving to disk, reassemble the file
+      if save_to_disk:
         # Sort results by start position
         sorted_results = sorted(results, key=lambda x: x[0])
 
@@ -237,14 +194,14 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
           raise ValueError(
             f"Downloaded file size ({len(complete_file)}) does not match expected size ({content_length})")
 
-        # Save to ramdisk if requested
-        if save_to_ramdisk and output_path:
+        # Save to disk
+        if output_path:
           try:
             with open(output_path, 'wb') as f:
               f.write(complete_file)
             print(f"Saved {file_display_name} to {output_path}")
           except Exception as e:
-            print(colored(f"Error saving file to ramdisk: {e}", "red"))
+            print(colored(f"Error saving file to disk: {e}", "red"))
 
         print(f"Successfully downloaded and validated {file_display_name}, size: {len(complete_file)} bytes")
 
@@ -396,12 +353,12 @@ def main():
   # Parse command line arguments
   args = parse_args()
 
-  # Set up ramdisk if requested
-  if args.save_to_ramdisk:
-    ramdisk_success = create_ramdisk(args.ramdisk_size_mb, args.ramdisk_path)
-    if not ramdisk_success:
-      print(colored("Warning: Failed to create ramdisk. Files will not be saved to disk.", "yellow"))
-      args.save_to_ramdisk = False
+  # Make sure save directory exists if specified
+  if args.save_to_disk:
+    directory_success = ensure_directory_exists(args.save_to_disk)
+    if not directory_success:
+      print(colored("Warning: Failed to create or access directory. Files will not be saved to disk.", "yellow"))
+      args.save_to_disk = None
 
   # Initialize S3 client for the main process
   s3_client = create_boto3_client(
@@ -411,19 +368,6 @@ def main():
     endpoint_url=args.endpoint_url,
     max_pool_connections=args.max_pool_connections
   )
-
-  # Format filename suffix
-  filename_suffix = args.filename_suffix or ""
-  if filename_suffix and filename_suffix[-1] != "_":
-    filename_suffix += "_"
-
-  # Delete previous files if requested
-  if args.delete_previous:
-    delete_prefix = args.prefix if args.prefix else filename_suffix
-    if delete_prefix:
-      delete_previous_files(args.bucket_name, delete_prefix, s3_client)
-    else:
-      print("Warning: Cannot delete previous files without a prefix or filename suffix")
 
   # Current timestamp for filenames
   timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -457,7 +401,7 @@ def main():
   else:
     # For download benchmark without prefix, upload the file first and use it as the source
     print("Preparing source file for download testing...")
-    source_filename = f"{filename_suffix}download_source_{timestamp}"
+    source_filename = f"download_source_{timestamp}"
     upload_test_file(
       bucket_name=args.bucket_name,
       object_key=source_filename,
@@ -526,9 +470,7 @@ def main():
       "actual_file_parallelism": max_workers,
       "concurrency_per_file": args.concurrency,
       "max_pool_connections": args.max_pool_connections,
-      "save_to_ramdisk": args.save_to_ramdisk,
-      "ramdisk_path": args.ramdisk_path if args.save_to_ramdisk else None,
-      "ramdisk_size_mb": args.ramdisk_size_mb if args.save_to_ramdisk else None,
+      "save_to_disk": args.save_to_disk,
     }
 
     summary = {
@@ -549,8 +491,7 @@ def main():
       "start_time": start_time.isoformat(),
       "end_time": end_time.isoformat(),
       "total_duration_seconds": (end_time - start_time).total_seconds(),
-      "persist_downloads": args.persist_downloads,
-      "delete_previous": args.delete_previous,
+      "save_to_disk": args.save_to_disk,
     }
 
     print("\nJSON Summary:")
