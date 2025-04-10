@@ -49,6 +49,8 @@ def parse_args():
   parser.add_argument("--chunk-size-kb", help="Chunk size in KB for streaming", type=int, default=1024)
   parser.add_argument("--auto-optimize", help="Automatically optimize parameters for CPU", action="store_true",
                       default=True)
+  parser.add_argument("--no-auto-optimize", help="Disable automatic parameter optimization", action="store_false",
+                      dest="auto_optimize")
 
   args = parser.parse_args()
 
@@ -538,6 +540,11 @@ def upload_test_file(bucket_name, object_key, object_size_mb, concurrency, multi
 
 def auto_optimize_parameters(args):
   """Automatically optimize parameters based on CPU count and system info"""
+  # Skip optimization if auto_optimize is False
+  if not args.auto_optimize:
+    print("Auto-optimization disabled. Using provided parameters.")
+    return args
+
   import psutil
 
   # Get system information
@@ -612,6 +619,8 @@ def main():
       args.concurrency = max(2, (cpu_count * 4) // args.file_parallelism)
       args.io_threads = max(2, cpu_count // args.file_parallelism)
       args.max_pool_connections = args.file_parallelism * args.concurrency * 2
+    else:
+      print("Auto-optimization disabled. Using provided parameters.")
 
   # Make sure save directory exists if specified
   if args.save_to_disk:
