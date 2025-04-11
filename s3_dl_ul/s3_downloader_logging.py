@@ -14,6 +14,7 @@ import logging
 import threading
 import atexit
 from collections import defaultdict, Counter
+import re
 
 import boto3
 import boto3.s3.transfer
@@ -30,9 +31,13 @@ try:
 except ImportError:
   HAS_ASYNCIO = False
 
-# Add global request counter dictionary and lock for thread safety
-request_counter = Counter()
-request_counter_lock = threading.Lock()
+# Create a shared file for tracking request counts across processes
+SHARED_COUNT_FILE = os.path.join(os.getcwd(), '.s3_request_counts.json')
+
+# Initialize the file if it doesn't exist
+if not os.path.exists(SHARED_COUNT_FILE):
+  with open(SHARED_COUNT_FILE, 'w') as f:
+    json.dump({"GetObject": 0, "HEAD_HeadObject": 0, "other": 0}, f)
 
 # Set up logging configuration
 logging.basicConfig(
@@ -43,10 +48,6 @@ logging.basicConfig(
     logging.StreamHandler()
   ]
 )
-
-# Create a specialized logger for boto3
-boto3_logger = logging.getLogger('boto3')
-boto3_logger.setLevel(logging.DEBUG)
 
 # Create a custom boto3 event handler to track requests
 request_logger = logging.getLogger('boto3.requestlogger')
@@ -67,53 +68,174 @@ request_logger.addHandler(console_handler)
 # Create a summary file for the total counts
 summary_log_path = 'boto3_requests_summary.log'
 
+# Add more detailed logging for boto3
+boto3_logger = logging.getLogger('boto3')
+boto3_logger.setLevel(logging.INFO)
 
-# Function to track boto3 requests
-def track_request(request, **kwargs):
-  """Track boto3 requests by operation and update counters"""
-  with request_counter_lock:
-    operation = request.headers.get('X-Amz-Target', request.url.split('/')[-1])
-    service = request.headers.get('Host', 'unknown').split('.')[0]
+botocore_logger = logging.getLogger('botocore')
+botocore_logger.setLevel(logging.INFO)
 
-    # Focus on S3 GET operations for counting downloads
-    if service == 's3' or 's3' in service:
-      method = request.method
-      path = request.url.split('?')[0] if '?' in request.url else request.url
-
-      # For S3 operations, extract the operation type
-      operation = 'GetObject' if method == 'GET' and '?' not in request.url.split('/')[-1] else operation
-
-      if method == 'GET' and operation == 'GetObject':
-        request_counter[operation] += 1
-        # Log detailed information about the GET request
-        request_logger.info(f"S3 {method} Request: {path} (Count: {request_counter[operation]})")
-      elif method:
-        # Count other types of requests too
-        operation_key = f"{method}_{operation}"
-        request_counter[operation_key] += 1
-        # Only log non-GET requests at debug level to reduce noise
-        request_logger.debug(f"S3 {method} Request: {operation} - {path}")
+# Add special logger for hooking into botocore events
+event_logger = logging.getLogger('botocore.hooks')
+event_logger.setLevel(logging.DEBUG)
+event_file_handler = logging.FileHandler('boto3_events.log')
+event_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+event_logger.addHandler(event_file_handler)
 
 
-# Register the event handler with boto3
-boto3.set_stream_logger('botocore.hooks', logging.DEBUG)
-boto3.DEFAULT_SESSION = boto3.Session()
-boto3.DEFAULT_SESSION.events.register('before-send.s3.*', track_request)
+# Function to track boto3 requests - this hook runs before the request is sent
+def track_request_before_send(request, **kwargs):
+  """Track boto3 requests before they are sent"""
+  try:
+    method = request.method
+    url = request.url
+    operation = "unknown"
+
+    # Extract operation from headers or URL
+    if 'X-Amz-Target' in request.headers:
+      operation = request.headers['X-Amz-Target']
+    else:
+      # For S3 operations - try to identify GetObject, HeadObject etc.
+      if method == 'GET':
+        if '?' not in url.split('/')[-1]:  # No query params in last path segment usually means GetObject
+          operation = "GetObject"
+        elif 'prefix=' in url:
+          operation = "ListObjects"
+        else:
+          operation = "OtherGET"
+      elif method == 'HEAD':
+        operation = "HeadObject"
+
+    # Format for logging
+    operation_key = f"{method}_{operation}"
+    path = url.split('?')[0] if '?' in url else url
+
+    # Log the request
+    if operation == "GetObject":
+      request_logger.info(f"S3 {method} Request: {path} (Operation: {operation})")
+      increment_counter("GetObject")
+    elif operation == "HeadObject":
+      request_logger.debug(f"S3 {method} Request: {path} (Operation: {operation})")
+      increment_counter("HEAD_HeadObject")
+    else:
+      request_logger.debug(f"S3 {method} Request: {path} (Operation: {operation})")
+      increment_counter("other")
+  except Exception as e:
+    request_logger.error(f"Error in track_request_before_send: {e}")
+
+
+# When the S3 GetObject event completes, also log it
+def track_call_after_getobject(request, response, **kwargs):
+  try:
+    if response and hasattr(response, 'status_code'):
+      request_logger.info(f"S3 GetObject completed with status: {response.status_code}")
+  except Exception as e:
+    request_logger.error(f"Error in track_call_after_getobject: {e}")
+
+
+# Increment the counter in the shared file
+def increment_counter(key):
+  try:
+    # Use file locking to handle concurrent access
+    with open(SHARED_COUNT_FILE, 'r+') as f:
+      fcntl.flock(f, fcntl.LOCK_EX)
+      try:
+        data = json.load(f)
+        data[key] = data.get(key, 0) + 1
+        f.seek(0)
+        f.truncate()
+        json.dump(data, f)
+      finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+  except Exception as e:
+    request_logger.error(f"Error incrementing counter: {e}")
+
+
+# Get the current counter values
+def get_counter_values():
+  try:
+    with open(SHARED_COUNT_FILE, 'r') as f:
+      fcntl.flock(f, fcntl.LOCK_SH)
+      try:
+        return json.load(f)
+      finally:
+        fcntl.flock(f, fcntl.LOCK_UN)
+  except Exception as e:
+    request_logger.error(f"Error reading counter: {e}")
+    return {"GetObject": 0, "HEAD_HeadObject": 0, "other": 0}
 
 
 # Function to write the current counter state to the summary file
 def write_summary():
-  with open(summary_log_path, 'w') as f:
-    f.write(f"=== Request Summary as of {datetime.now().isoformat()} ===\n")
-    for op, count in sorted(request_counter.items(), key=lambda x: x[1], reverse=True):
-      f.write(f"{op}: {count}\n")
-    f.write(f"Total GET Object requests: {request_counter.get('GetObject', 0)}\n")
-    f.write("=" * 50 + "\n")
+  try:
+    counters = get_counter_values()
 
-  # Also log the summary to console
-  request_logger.info(f"Request summary written to {summary_log_path}")
-  request_logger.info(f"Total GET Object requests: {request_counter.get('GetObject', 0)}")
+    with open(summary_log_path, 'w') as f:
+      f.write(f"=== Request Summary as of {datetime.now().isoformat()} ===\n")
+      for op, count in sorted(counters.items(), key=lambda x: x[1], reverse=True):
+        f.write(f"{op}: {count}\n")
+      f.write("=" * 50 + "\n")
 
+    # Also log the summary to console
+    request_logger.info(f"Request summary written to {summary_log_path}")
+    request_logger.info(f"Total GET Object requests: {counters.get('GetObject', 0)}")
+
+  except Exception as e:
+    request_logger.error(f"Error writing summary: {e}")
+
+
+# Alternative hook for tracking GetObject events directly from botocore hooks
+def track_s3_events(event_name, **kwargs):
+  """Track S3 events from botocore hooks"""
+  try:
+    if 'GetObject' in event_name:
+      # For debugging, see what's coming through in these events
+      request_logger.debug(f"S3 Event: {event_name}")
+      if event_name == 'before-call.s3.GetObject':
+        increment_counter("GetObject")
+        request_logger.info(f"S3 GetObject Request detected via event hook")
+  except Exception as e:
+    request_logger.error(f"Error in track_s3_events: {e}")
+
+
+# Parse wire-level HTTP requests to count GetObject operations
+class S3RequestCounter:
+  def __init__(self):
+    # Set up a hook on the urllib3 connection pool
+    from botocore.httpsession import URLLib3Session
+    self.original_send = URLLib3Session.send
+    URLLib3Session.send = self.send_wrapper
+
+  def send_wrapper(self, request, *args, **kwargs):
+    try:
+      method = request.method
+      url = request.url
+
+      # Detect GetObject requests at the HTTP level
+      if method == 'GET' and isinstance(url, str) and 's3' in url.lower():
+        # Check if this is likely a GetObject (no query params in URL)
+        if '?' not in url.split('/')[-1]:
+          request_logger.info(f"HTTP-level S3 GetObject detected: {url}")
+          increment_counter("GetObject")
+    except Exception as e:
+      request_logger.error(f"Error in HTTP request counter: {e}")
+
+    # Call original method
+    return self.original_send(request, *args, **kwargs)
+
+
+# Register the event handler with boto3 events system
+# This runs before a request is sent
+boto3.DEFAULT_SESSION = boto3.Session()
+boto3.DEFAULT_SESSION.events.register('before-send.s3.*', track_request_before_send)
+
+# Register with more specific event for GetObject
+boto3.DEFAULT_SESSION.events.register('before-call.s3.GetObject',
+                                      lambda **kwargs: increment_counter("GetObject"))
+boto3.DEFAULT_SESSION.events.register('after-call.s3.GetObject', track_call_after_getobject)
+
+# Install the HTTP-level request counter
+s3_request_counter = S3RequestCounter()
 
 # Register the summary writer to run when the program exits
 atexit.register(write_summary)
@@ -124,6 +246,25 @@ def update_summary_periodically(interval=30):
   """Update the summary file periodically"""
   threading.Timer(interval, update_summary_periodically, [interval]).start()
   write_summary()
+
+
+# Utility function to parse botocore logs for GetObject calls
+def parse_log_for_getobject(log_file="boto3_requests.log"):
+  """Parse the log file to count GetObject calls"""
+  get_object_pattern = re.compile(r'Event (before-call|before-send|needs-retry)\.s3\.GetObject')
+  count = 0
+
+  try:
+    with open(log_file, 'r') as f:
+      for line in f:
+        if get_object_pattern.search(line):
+          # Only count before-call events to avoid duplicates
+          if 'before-call.s3.GetObject' in line:
+            count += 1
+            increment_counter("GetObject_from_log")
+    request_logger.info(f"Found {count} GetObject calls in log file")
+  except Exception as e:
+    request_logger.error(f"Error parsing log: {e}")
 
 
 # Start the periodic summary updater
@@ -198,8 +339,10 @@ def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_c
     use_dualstack_endpoint=False,  # Disable dual stack for better performance if not needed
   )
 
-  # Register event handler for this session too
-  session.events.register('before-send.s3.*', track_request)
+  # Register event handlers for this session
+  session.events.register('before-send.s3.*', track_request_before_send)
+  session.events.register('before-call.s3.GetObject',
+                          lambda **kwargs: increment_counter("GetObject"))
 
   # Create the client with optimized settings
   client = session.client("s3", endpoint_url=endpoint_url, config=botocore_config)
@@ -486,6 +629,10 @@ def process_single_file(args_dict, file_index, timestamp, file_key):
       # Update request counter summary periodically
       if file_index % 5 == 0:  # Every 5 files
         write_summary()
+
+      # After a successful download, let's do an immediate GetObject request count
+      counters = get_counter_values()
+      request_logger.info(f"Current GET request count: {counters.get('GetObject', 0)}")
 
       # Return information
       return {
@@ -954,9 +1101,13 @@ def main():
         print(error_msg)
         request_logger.error(error_msg)
 
+  # Try to scan botocore logs for GetObject calls
+  parse_log_for_getobject()
+
   # Write final request summary before validation
   write_summary()
-  request_logger.info(f"All downloads completed. Total GET requests: {request_counter.get('GetObject', 0)}")
+  counts = get_counter_values()
+  request_logger.info(f"All downloads completed. Total GET requests: {counts.get('GetObject', 0)}")
 
   # Validate all downloaded files after all downloads are complete
   validation_results = validate_downloaded_files(download_results, args)
@@ -977,6 +1128,9 @@ def main():
       "total_throughput": float(f"{np.sum(agg_throughputs):.2f}"),
     }
 
+    # Get final request counts
+    counts = get_counter_values()
+
     # Add machine info for reference
     machine_info = {
       "cpu_count": os.cpu_count(),
@@ -986,7 +1140,7 @@ def main():
       "max_pool_connections": args.max_pool_connections,
       "save_to_disk": args.save_to_disk,
       "streaming_mode": args.streaming_mode,
-      "total_get_requests": request_counter.get('GetObject', 0)
+      "total_get_requests": counts.get('GetObject', 0)
     }
 
     summary = {
@@ -1013,10 +1167,7 @@ def main():
         "successful_downloads": sum(1 for r in validation_results if r['download_success']),
         "validation_failures": sum(1 for r in validation_results if r.get('validation_success') is False)
       },
-      "request_stats": {
-        "total_get_requests": request_counter.get('GetObject', 0),
-        "request_counts": dict(request_counter)
-      }
+      "request_stats": counts
     }
 
     # Save the summary to a results file
@@ -1034,12 +1185,12 @@ def main():
     total_throughput = agg_stats["total_throughput"]
     print(f"\nTotal Combined Throughput: {total_throughput:.2f} MiB/sec")
     print(f"Total Duration: {total_duration:.2f} seconds")
-    print(f"Total GET Requests: {request_counter.get('GetObject', 0)}")
+    print(f"Total GET Requests: {counts.get('GetObject', 0)}")
 
     # Log the final summary
     request_logger.info(f"Total Combined Throughput: {total_throughput:.2f} MiB/sec")
     request_logger.info(f"Total Duration: {total_duration:.2f} seconds")
-    request_logger.info(f"Total GET Requests: {request_counter.get('GetObject', 0)}")
+    request_logger.info(f"Total GET Requests: {counts.get('GetObject', 0)}")
     request_logger.info("==== Benchmark Complete ====")
   else:
     error_msg = "No successful downloads to report."
