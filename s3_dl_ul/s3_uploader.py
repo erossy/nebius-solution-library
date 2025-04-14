@@ -22,6 +22,8 @@ def parse_args():
   parser.add_argument("--endpoint-url", help="Endpoint URL", required=True)
   parser.add_argument("--bucket-name", help="Bucket Name", required=True)
   parser.add_argument("--filename-suffix", help="Filename suffix (can be without _ in the end)", required=False)
+  # Added new parameter for prefix
+  parser.add_argument("--object-prefix", help="Prefix for S3 object keys", default="")
   parser.add_argument("--iteration-number", help="Iteration Number", type=int, required=True)
   parser.add_argument("--object-size-mb", help="Object Size in MB", type=int, required=True)
   parser.add_argument("--concurrency", help="Concurrency per file", type=int, required=True)
@@ -92,6 +94,8 @@ def process_single_file(args_dict, file_index, timestamp):
   secret_key = args_dict['secret_access_key']
   region = args_dict['region_name']
   filename_suffix = args_dict.get('filename_suffix', '') or ''
+  # Extract the new object prefix parameter
+  object_prefix = args_dict.get('object_prefix', '') or ''
   max_pool_connections = args_dict['max_pool_connections']
 
   # Create a client for the main operations
@@ -117,8 +121,13 @@ def process_single_file(args_dict, file_index, timestamp):
       # Generate random data for upload
       data = np.random.bytes(object_size_mb * 1024 * 1024)
 
-      # Create a unique object key
-      object_key = f"{filename_suffix}my_upload_{file_index}_{timestamp}"
+      # Format prefix to include trailing slash if needed
+      formatted_prefix = ""
+      if object_prefix:
+        formatted_prefix = object_prefix if object_prefix.endswith('/') else f"{object_prefix}/"
+
+      # Create a unique object key with the prefix
+      object_key = f"{formatted_prefix}{filename_suffix}my_upload_{file_index}_{timestamp}"
 
       # Start a multipart upload
       multipart_upload = s3_client.create_multipart_upload(
@@ -231,13 +240,17 @@ def main():
   if filename_suffix and filename_suffix[-1] != "_":
     filename_suffix += "_"
 
+  # Format object prefix
+  object_prefix = args.object_prefix or ""
+
   # Delete previous files if requested
   if args.delete_previous:
-    delete_prefix = filename_suffix
+    # Use the object prefix for deletion if provided
+    delete_prefix = object_prefix if object_prefix else filename_suffix
     if delete_prefix:
       delete_previous_files(args.bucket_name, delete_prefix, s3_client)
     else:
-      print("Warning: Cannot delete previous files without a filename suffix")
+      print("Warning: Cannot delete previous files without a prefix or filename suffix")
 
   # Current timestamp for filenames
   timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -317,6 +330,8 @@ def main():
       "end_time": end_time.isoformat(),
       "total_duration_seconds": (end_time - start_time).total_seconds(),
       "delete_previous": args.delete_previous,
+      # Add prefix information to the summary
+      "object_prefix": object_prefix,
     }
 
     print("\nJSON Summary:")
