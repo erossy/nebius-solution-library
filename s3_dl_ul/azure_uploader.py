@@ -1,4 +1,3 @@
-#
 import argparse
 import json
 import multiprocessing
@@ -92,13 +91,6 @@ def process_single_file(args_dict, file_index, timestamp):
   )
 
   container_client = blob_service_client.get_container_client(container_name)
-
-  # Ensure container exists
-  try:
-    container_client.create_container()
-    print(f"Container '{container_name}' created.")
-  except ResourceExistsError:
-    print(f"Container '{container_name}' already exists.")
 
   # Calculate actual multipart size in bytes
   multipart_size = multipart_size_mb * 1024 * 1024
