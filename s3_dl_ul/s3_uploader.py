@@ -121,6 +121,21 @@ def upload_part_worker(args):
   """Worker function for uploading a part of a file"""
   bucket_name, object_key, upload_id, part_number, source, start, part_size, endpoint_url, access_key, secret_key, region = args
 
+  # If source is None, create a simple data source for this part
+  if source is None:
+    # Create a simple pattern for this part
+    pattern_chunk = b'x' * min(1024 * 1024, part_size)  # 1MB or smaller
+    if len(pattern_chunk) == part_size:
+      source = io.BytesIO(pattern_chunk)
+    else:
+      source = io.BytesIO()
+      remaining = part_size
+      while remaining > 0:
+        write_size = min(len(pattern_chunk), remaining)
+        source.write(pattern_chunk[:write_size])
+        remaining -= write_size
+      source.seek(0)
+
   # Create a fresh client for this worker
   s3_client = create_boto3_client(
     access_key=access_key,
@@ -147,7 +162,7 @@ def upload_part_worker(args):
     raise
 
 
-def process_single_file(args_dict, file_index, timestamp, shared_source=None):
+def process_single_file(args_dict, file_index, timestamp, cache_file_path=None):
   """Process a single file upload"""
   # Extract parameters from the dictionary
   bucket_name = args_dict['bucket_name']
@@ -162,6 +177,31 @@ def process_single_file(args_dict, file_index, timestamp, shared_source=None):
   object_prefix = args_dict.get('object_prefix', '') or ''
   max_pool_connections = args_dict['max_pool_connections']
   use_cache_file = args_dict.get('use_cache_file', False)
+
+  # Open data source within this process
+  shared_source = None
+  shared_file = None
+
+  if use_cache_file and cache_file_path:
+    # Open the cache file in this process
+    shared_file = open(cache_file_path, 'rb')
+    # Memory map the file for efficient access
+    shared_source = mmap.mmap(shared_file.fileno(), 0, access=mmap.ACCESS_READ)
+  else:
+    # Create a single reusable buffer with pattern data
+    buffer_size = min(object_size_mb * 1024 * 1024, 64 * 1024 * 1024)  # Max 64MB in memory
+    pattern = b'x' * 1024 * 1024  # 1MB pattern
+    buffer = io.BytesIO()
+
+    # Fill buffer with repeating pattern
+    remaining = buffer_size
+    while remaining > 0:
+      write_size = min(len(pattern), remaining)
+      buffer.write(pattern[:write_size])
+      remaining -= write_size
+
+    buffer.seek(0)
+    shared_source = buffer
 
   # Create a client for the main operations
   s3_client = create_boto3_client(
@@ -323,33 +363,10 @@ def main():
   max_workers = min(args.file_parallelism, args.iteration_number)
   print(f"Using {max_workers} parallel workers for file operations")
 
-  # Prepare data source (either cached file or memory buffer)
-  shared_source = None
-  shared_file = None
-
+  # Create cache file if needed, but don't open it here
+  cache_file_path = None
   if args.use_cache_file:
-    # Create or use a cache file
     cache_file_path = create_or_get_cache_file(args.object_size_mb)
-    shared_file = open(cache_file_path, 'rb')
-
-    # Memory map the file for efficient access
-    shared_source = mmap.mmap(shared_file.fileno(), 0, access=mmap.ACCESS_READ)
-  else:
-    # Create a single reusable buffer with pattern data instead of random data
-    # This is much faster than generating random data for each upload
-    buffer_size = min(args.object_size_mb * 1024 * 1024, 512 * 1024 * 1024)  # Max 512MB in memory
-    pattern = b'x' * 1024 * 1024  # 1MB pattern
-    buffer = io.BytesIO()
-
-    # Fill buffer with repeating pattern
-    remaining = buffer_size
-    while remaining > 0:
-      write_size = min(len(pattern), remaining)
-      buffer.write(pattern[:write_size])
-      remaining -= write_size
-
-    buffer.seek(0)
-    shared_source = buffer
 
   throughputs = []
 
@@ -368,7 +385,7 @@ def main():
           args_dict,
           i,
           timestamp,
-          shared_source
+          cache_file_path
         )
         futures.append(future)
 
@@ -380,11 +397,8 @@ def main():
         except Exception as e:
           print(f"File processing failed: {e}")
   finally:
-    # Clean up resources
-    if shared_source and hasattr(shared_source, 'close'):
-      shared_source.close()
-    if shared_file:
-      shared_file.close()
+    # No shared resources to clean up in the main process anymore
+    pass
 
   end_time = datetime.now()
 
