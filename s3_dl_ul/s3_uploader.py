@@ -6,7 +6,6 @@ import concurrent.futures
 from datetime import datetime
 import os
 import io
-import mmap
 
 import boto3
 import boto3.s3.transfer
@@ -32,8 +31,7 @@ def parse_args():
   parser.add_argument("--max-pool-connections", help="Max boto3 connection pool size", type=int, default=100)
   parser.add_argument("--delete-previous", help="Delete previous files with the same prefix before starting",
                       action="store_true")
-  # New flag to use cached data for uploads
-  parser.add_argument("--use-cache-file", help="Use a cached file instead of random data", action="store_true")
+  # No more cache file option as we'll use a completely different approach
 
   args = parser.parse_args()
 
@@ -45,7 +43,7 @@ def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_c
   """Create a boto3 S3 client with the given credentials"""
   session = boto3.session.Session(
     aws_access_key_id=access_key,
-    aws_secret_access_key=secret_key,
+    aws_secret_access_secret=secret_key,
     region_name=region,
   )
 
@@ -57,117 +55,46 @@ def create_boto3_client(access_key, secret_key, region, endpoint_url, max_pool_c
   return session.client("s3", endpoint_url=endpoint_url, config=botocore_config)
 
 
-def create_or_get_cache_file(size_mb, cache_file_path="upload_cache.bin"):
-  """Create or get a cache file of specified size"""
-  size_bytes = size_mb * 1024 * 1024
+class LazyFixedPatternBody:
+  """A lazy body that generates fixed pattern data on demand without storing it all in memory"""
 
-  # Check if cache file exists with right size
-  if os.path.exists(cache_file_path):
-    file_size = os.path.getsize(cache_file_path)
-    if file_size >= size_bytes:
-      print(f"Using existing cache file: {cache_file_path}")
-      return cache_file_path
-
-  # Create a new cache file
-  print(f"Creating new cache file of {size_mb} MB...")
-  with open(cache_file_path, 'wb') as f:
-    # Create file in chunks to avoid memory issues
-    chunk_size = min(64 * 1024 * 1024, size_bytes)  # 64MB chunks or smaller
-    remaining = size_bytes
-
-    # Reuse the same data chunk for efficiency
-    data_chunk = b'x' * chunk_size
-
-    while remaining > 0:
-      write_size = min(chunk_size, remaining)
-      if write_size < chunk_size:
-        f.write(data_chunk[:write_size])
-      else:
-        f.write(data_chunk)
-      remaining -= write_size
-
-  return cache_file_path
-
-
-class StreamingBody:
-  """Class to stream data from a file or memory buffer for S3 uploads"""
-
-  def __init__(self, source, start, size):
-    self.source = source
-    self.start = start
+  def __init__(self, size, pattern=None):
     self.size = size
     self.position = 0
+    # Default pattern is "x" repeated
+    self.pattern = pattern or b'x' * min(1024 * 1024, size)  # 1MB pattern or smaller
 
   def read(self, size=None):
     if self.position >= self.size:
       return b''
 
     if size is None or size < 0:
-      size = self.size
+      size = self.size - self.position
 
     read_size = min(size, self.size - self.position)
+    self.position += read_size
 
-    if isinstance(self.source, mmap.mmap):
-      data = self.source[self.start + self.position:self.start + self.position + read_size]
+    # Generate the data on-the-fly
+    if read_size <= len(self.pattern):
+      # If we need less than one pattern, return a slice
+      return self.pattern[:read_size]
     else:
-      self.source.seek(self.start + self.position)
-      data = self.source.read(read_size)
+      # For larger reads, we'll need to repeat the pattern
+      repeats = read_size // len(self.pattern)
+      remainder = read_size % len(self.pattern)
 
-    self.position += len(data)
-    return data
+      # Create and return the data without storing it all at once
+      result = self.pattern * repeats
+      if remainder:
+        result += self.pattern[:remainder]
 
-
-def upload_part_worker(args):
-  """Worker function for uploading a part of a file"""
-  bucket_name, object_key, upload_id, part_number, source, start, part_size, endpoint_url, access_key, secret_key, region = args
-
-  # If source is None, create a simple data source for this part
-  if source is None:
-    # Create a simple pattern for this part
-    pattern_chunk = b'x' * min(1024 * 1024, part_size)  # 1MB or smaller
-    if len(pattern_chunk) == part_size:
-      source = io.BytesIO(pattern_chunk)
-    else:
-      source = io.BytesIO()
-      remaining = part_size
-      while remaining > 0:
-        write_size = min(len(pattern_chunk), remaining)
-        source.write(pattern_chunk[:write_size])
-        remaining -= write_size
-      source.seek(0)
-
-  # Create a fresh client for this worker
-  s3_client = create_boto3_client(
-    access_key=access_key,
-    secret_key=secret_key,
-    region=region,
-    endpoint_url=endpoint_url,
-    max_pool_connections=20  # Smaller pool for part workers
-  )
-
-  try:
-    # Create a streaming body for this part
-    body = StreamingBody(source, start, part_size)
-
-    response = s3_client.upload_part(
-      Bucket=bucket_name,
-      Key=object_key,
-      PartNumber=part_number,
-      UploadId=upload_id,
-      Body=body
-    )
-    return part_number, response['ETag']
-  except Exception as e:
-    print(f"Error uploading part {part_number} of {object_key}: {e}")
-    raise
+      return result
 
 
-def process_single_file(args_dict, file_index, timestamp, cache_file_path=None):
-  """Process a single file upload"""
-  # Extract parameters from the dictionary
+def upload_object_direct(args_dict, file_index, timestamp):
+  """Upload a single object using boto3's upload_fileobj with fixed pattern data"""
+  # Extract parameters
   bucket_name = args_dict['bucket_name']
-  concurrency = args_dict['concurrency']
-  multipart_size_mb = args_dict['multipart_size_mb']
   object_size_mb = args_dict['object_size_mb']
   endpoint_url = args_dict['endpoint_url']
   access_key = args_dict['access_key_aws_id']
@@ -175,119 +102,68 @@ def process_single_file(args_dict, file_index, timestamp, cache_file_path=None):
   region = args_dict['region_name']
   filename_suffix = args_dict.get('filename_suffix', '') or ''
   object_prefix = args_dict.get('object_prefix', '') or ''
+  multipart_size_mb = args_dict['multipart_size_mb']
   max_pool_connections = args_dict['max_pool_connections']
-  use_cache_file = args_dict.get('use_cache_file', False)
 
-  # Open data source within this process
-  shared_source = None
-  shared_file = None
-
-  if use_cache_file and cache_file_path:
-    # Open the cache file in this process
-    shared_file = open(cache_file_path, 'rb')
-    # Memory map the file for efficient access
-    shared_source = mmap.mmap(shared_file.fileno(), 0, access=mmap.ACCESS_READ)
-  else:
-    # Create a single reusable buffer with pattern data
-    buffer_size = min(object_size_mb * 1024 * 1024, 64 * 1024 * 1024)  # Max 64MB in memory
-    pattern = b'x' * 1024 * 1024  # 1MB pattern
-    buffer = io.BytesIO()
-
-    # Fill buffer with repeating pattern
-    remaining = buffer_size
-    while remaining > 0:
-      write_size = min(len(pattern), remaining)
-      buffer.write(pattern[:write_size])
-      remaining -= write_size
-
-    buffer.seek(0)
-    shared_source = buffer
-
-  # Create a client for the main operations
-  s3_client = create_boto3_client(
-    access_key=access_key,
-    secret_key=secret_key,
-    region=region,
+  # Create S3 client
+  s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=access_key,
+    aws_secret_access_key=secret_key,
+    region_name=region,
     endpoint_url=endpoint_url,
-    max_pool_connections=max_pool_connections
+    config=botocore.config.Config(
+      max_pool_connections=max_pool_connections,
+      retries={'max_attempts': 10, 'mode': 'adaptive'}
+    )
   )
 
-  # Calculate actual multipart size in bytes
-  multipart_size = multipart_size_mb * 1024 * 1024
-  total_size_bytes = object_size_mb * 1024 * 1024
+  # Format prefix
+  formatted_prefix = ""
+  if object_prefix:
+    formatted_prefix = object_prefix if object_prefix.endswith('/') else f"{object_prefix}/"
 
+  # Create object key
+  object_key = f"{formatted_prefix}{filename_suffix}my_upload_{file_index}_{timestamp}"
+
+  # Calculate sizes
+  total_size_bytes = object_size_mb * 1024 * 1024
+  multipart_size_bytes = multipart_size_mb * 1024 * 1024
+
+  # Create the data source that generates fixed pattern data on demand
+  data_source = LazyFixedPatternBody(total_size_bytes)
+
+  # Measure performance
   operation_start = time.time()
   retry_count = 0
   max_retries = 10
   file_display_name = f"file_{file_index}"
 
-  # Main processing loop with retries
+  # Upload with retries
   while retry_count <= max_retries:
     try:
-      # Format prefix to include trailing slash if needed
-      formatted_prefix = ""
-      if object_prefix:
-        formatted_prefix = object_prefix if object_prefix.endswith('/') else f"{object_prefix}/"
-
-      # Create a unique object key with the prefix
-      object_key = f"{formatted_prefix}{filename_suffix}my_upload_{file_index}_{timestamp}"
-
-      # Start a multipart upload
-      multipart_upload = s3_client.create_multipart_upload(
-        Bucket=bucket_name,
-        Key=object_key
+      # Use the transfer manager for automatic multipart uploads
+      s3_client.upload_fileobj(
+        data_source,
+        bucket_name,
+        object_key,
+        Config=boto3.s3.transfer.TransferConfig(
+          multipart_threshold=multipart_size_bytes,
+          max_concurrency=args_dict['concurrency'],
+          multipart_chunksize=multipart_size_bytes,
+          use_threads=True  # Use threads within this process
+        )
       )
-      upload_id = multipart_upload['UploadId']
-
-      # Prepare the parts for upload
-      upload_parts = []
-      part_number = 1
-      position = 0
-
-      while position < total_size_bytes:
-        part_size = min(multipart_size, total_size_bytes - position)
-
-        upload_parts.append((
-          bucket_name,
-          object_key,
-          upload_id,
-          part_number,
-          shared_source,  # Pass the shared file or buffer
-          position,  # Start position
-          part_size,  # Size to read
-          endpoint_url,
-          access_key,
-          secret_key,
-          region
-        ))
-
-        position += part_size
-        part_number += 1
-
-      # Upload parts in parallel
-      with multiprocessing.Pool(processes=concurrency) as pool:
-        results = pool.map(upload_part_worker, upload_parts)
-
-      # Complete the multipart upload
-      s3_client.complete_multipart_upload(
-        Bucket=bucket_name,
-        Key=object_key,
-        UploadId=upload_id,
-        MultipartUpload={
-          'Parts': [{'PartNumber': part_num, 'ETag': etag} for part_num, etag in results]
-        }
-      )
-
-      # If we get here, the operation was successful
       break
-
     except Exception as e:
       retry_count += 1
       if retry_count > max_retries:
         print(f"Failed to process {file_display_name} after {max_retries} retries: {e}")
         raise
       print(f"Error processing {file_display_name} (attempt {retry_count}/{max_retries}): {e}")
-      time.sleep(1)  # Wait before retrying
+      time.sleep(1)
+      # Reset the position for next retry
+      data_source.position = 0
 
   # Calculate throughput
   operation_end = time.time()
@@ -331,12 +207,15 @@ def main():
   args = parse_args()
 
   # Initialize S3 client for the main process
-  s3_client = create_boto3_client(
-    access_key=args.access_key_aws_id,
-    secret_key=args.secret_access_key,
-    region=args.region_name,
+  s3_client = boto3.client(
+    "s3",
+    aws_access_key_id=args.access_key_aws_id,
+    aws_secret_access_key=args.secret_access_key,
+    region_name=args.region_name,
     endpoint_url=args.endpoint_url,
-    max_pool_connections=args.max_pool_connections
+    config=botocore.config.Config(
+      max_pool_connections=args.max_pool_connections
+    )
   )
 
   # Format filename suffix
@@ -363,48 +242,38 @@ def main():
   max_workers = min(args.file_parallelism, args.iteration_number)
   print(f"Using {max_workers} parallel workers for file operations")
 
-  # Create cache file if needed, but don't open it here
-  cache_file_path = None
-  if args.use_cache_file:
-    cache_file_path = create_or_get_cache_file(args.object_size_mb)
-
   throughputs = []
 
-  # Convert args to dictionary for pickling
+  # Convert args to dictionary for pickling (no complex objects like mmap)
   args_dict = vars(args)
 
-  try:
-    # Use ProcessPoolExecutor to handle multiple files in parallel
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-      futures = []
+  # Use ProcessPoolExecutor for file parallelism
+  with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+    futures = []
 
-      # Submit all file processing tasks
-      for i in range(args.iteration_number):
-        future = executor.submit(
-          process_single_file,
-          args_dict,
-          i,
-          timestamp,
-          cache_file_path
-        )
-        futures.append(future)
+    # Submit all file processing tasks
+    for i in range(args.iteration_number):
+      future = executor.submit(
+        upload_object_direct,
+        args_dict,
+        i,
+        timestamp
+      )
+      futures.append(future)
 
-      # Collect results as they complete
-      for future in concurrent.futures.as_completed(futures):
-        try:
-          throughput = future.result()
-          throughputs.append(throughput)
-        except Exception as e:
-          print(f"File processing failed: {e}")
-  finally:
-    # No shared resources to clean up in the main process anymore
-    pass
+    # Collect results as they complete
+    for future in concurrent.futures.as_completed(futures):
+      try:
+        throughput = future.result()
+        throughputs.append(throughput)
+      except Exception as e:
+        print(f"File processing failed: {e}")
 
   end_time = datetime.now()
 
   # Calculate statistics across all iterations
   if throughputs:
-    import numpy as np  # Only import numpy here for statistics, not for data generation
+    import numpy as np  # Only import numpy here for statistics
 
     agg_throughputs = np.array(throughputs)
     percentiles = np.percentile(agg_throughputs, [0, 5, 50, 75, 95, 100])
@@ -423,7 +292,6 @@ def main():
       "actual_file_parallelism": max_workers,
       "concurrency_per_file": args.concurrency,
       "max_pool_connections": args.max_pool_connections,
-      "using_cache_file": args.use_cache_file
     }
 
     summary = {
